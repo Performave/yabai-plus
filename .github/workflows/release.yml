@@ -23,9 +23,16 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build, e.g. v7.1.25-plus.1
+        required: true
 
 permissions:
   contents: write   # needed to create the GitHub Release
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   release:
@@ -33,6 +40,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Import Apple signing certificate
         # Creates a temporary `signing_temp` keychain, imports the Developer ID
@@ -44,7 +53,7 @@ jobs:
           p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
 
       - name: Build (universal)
-        run: make install
+        run: make install VERSION="${RELEASE_TAG}"
 
       - name: Build man page
         run: |
@@ -100,8 +109,10 @@ jobs:
           tar -cvzf "bin/${VERSION}.tar.gz" archive
           rm -rf archive
           SHA256="$(shasum -a 256 "bin/${VERSION}.tar.gz" | cut -d' ' -f1)"
+          printf '%s  %s.tar.gz\n' "${SHA256}" "${VERSION}" > "bin/${VERSION}.tar.gz.sha256"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tarball=bin/${VERSION}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=bin/${VERSION}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
           echo "asset=${VERSION}.tar.gz" >> "$GITHUB_OUTPUT"
           echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
           echo "Built ${VERSION}.tar.gz  sha256=${SHA256}"
@@ -111,7 +122,7 @@ jobs:
         run: |
           set -euo pipefail
           # Tag is e.g. v7.1.25-plus.1 -> changelog heading is "## [7.1.25-plus.1]".
-          TAG="${{ github.ref_name }}"
+          TAG="${RELEASE_TAG}"
           HEADING="${TAG#v}"
           NOTES_FILE="$RUNNER_TEMP/release-notes.md"
 
@@ -134,9 +145,11 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ steps.archive.outputs.version }}
-          files: ${{ steps.archive.outputs.tarball }}
+          files: |
+            ${{ steps.archive.outputs.tarball }}
+            ${{ steps.archive.outputs.checksum }}
           body_path: ${{ steps.notes.outputs.file }}
           # Fall back to auto-generated notes only if no changelog section was found.
           generate_release_notes: ${{ steps.notes.outputs.file == '' }}
@@ -147,7 +160,7 @@ jobs:
         # with contents:write on the tap repo); skipped if it isn't configured.
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ env.RELEASE_TAG }}
           ASSET: ${{ steps.archive.outputs.asset }}
           SHA256: ${{ steps.archive.outputs.sha256 }}
         run: |

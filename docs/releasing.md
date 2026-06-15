@@ -11,7 +11,7 @@ version tag is pushed. You should rarely need to build a release by hand.
 ## TL;DR
 
 ```bash
-# 1. Bump the version in src/yabai.c (MAJOR/MINOR/PATCH).
+# 1. Bump the upstream fallback version in src/yabai.c (MAJOR/MINOR/PATCH).
 # 2. Add a CHANGELOG.md entry.
 # 3. Commit, then tag and push:
 git tag v7.1.25-plus.1
@@ -40,11 +40,11 @@ The version string is compiled into the binary from `src/yabai.c`:
 #define PATCH 25
 ```
 
-`yabai --version` prints `yabai-v7.1.25`, and the release archive is named from
-that output (`yabai-v<version>.tar.gz`). If you want the `-plus.N` suffix to show
-up in `--version` and the artifact name, extend the version macros / print format
-in `src/yabai.c` accordingly. At minimum, bump `PATCH`/`MINOR`/`MAJOR` to match
-the upstream base you rebased onto.
+`yabai --version` prints `yabai-${YABAI_VERSION}`. For release builds, the GitHub
+Actions workflow passes the pushed tag into `make`, so a tag like
+`v7.1.25-plus.1` produces `yabai-v7.1.25-plus.1` and an archive named from that
+output. Local builds on an exact tag pick up that tag via `git describe`; untagged
+builds fall back to the upstream version string in `src/yabai.c`.
 
 ## What the release workflow does
 
@@ -57,7 +57,7 @@ On a `v*` tag push (`.github/workflows/release.yml`), a `macos-14` runner:
    (`codesign --force --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY"`).
 5. **Notarizes** via `xcrun notarytool submit --wait` using an App Store Connect
    API key.
-6. **Assembles** `bin/yabai-v<version>.tar.gz` containing `bin/`, `doc/`, `examples/`.
+6. **Assembles** `bin/yabai-v<version>.tar.gz` containing `bin/`, `doc/`, `examples/`, plus a `.sha256` checksum file.
 7. **Creates** a GitHub Release for the tag with the tarball attached.
 
 ## Signing & notarization notes
@@ -84,7 +84,7 @@ These are the non-obvious bits that cause most release failures:
 If CI is unavailable:
 
 ```bash
-make install          # universal build into bin/yabai
+make install VERSION="v7.1.25-plus.1"  # universal build into bin/yabai
 make man              # man page (requires asciidoctor)
 codesign --force --timestamp --options runtime \
   --sign "Developer ID Application: <Your Name> (TEAMID)" bin/yabai
@@ -101,10 +101,14 @@ rm -rf archive && mkdir archive
 cp -r bin doc examples archive/
 tar -cvzf "bin/${VERSION}.tar.gz" archive
 rm -rf archive
-shasum -a 256 "bin/${VERSION}.tar.gz"
+SHA256="$(shasum -a 256 "bin/${VERSION}.tar.gz" | cut -d' ' -f1)"
+printf '%s  %s.tar.gz\n' "${SHA256}" "${VERSION}" > "bin/${VERSION}.tar.gz.sha256"
 
 # publish
-gh release create v7.1.25-plus.1 "bin/${VERSION}.tar.gz" --generate-notes
+gh release create v7.1.25-plus.1 \
+  "bin/${VERSION}.tar.gz" \
+  "bin/${VERSION}.tar.gz.sha256" \
+  --generate-notes
 ```
 
 ## Homebrew tap
@@ -125,6 +129,6 @@ can bump the formula by hand.
 
 ## After releasing
 
-- `scripts/install.sh` carries a hard-coded `VERSION` + `EXPECTED_HASH` (upstream's
-  curl installer). If you distribute via that script, run `make publish` to update
-  those fields, or update them by hand.
+- `scripts/install.sh` carries a hard-coded `VERSION` and verifies downloads using
+  the release's `.sha256` asset. If you distribute via that script, update
+  `VERSION` before tagging.

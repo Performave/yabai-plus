@@ -11,6 +11,18 @@ inherited from upstream.
 
 ## [Unreleased]
 
+## [7.1.25-plus.2]
+
+### Changed (yabai-plus)
+- Compile release builds with the pushed git tag as `yabai --version`, so fork
+  releases report strings like `yabai-v7.1.25-plus.2` instead of the upstream-only
+  version.
+- Publish a `.sha256` checksum asset with release archives and update
+  `scripts/install.sh` to verify downloads against that asset from
+  `Performave/yabai-plus`.
+- Require an explicit tag when manually dispatching the release workflow, avoiding
+  accidental branch-name version strings in release builds.
+
 ## [7.1.25-plus.1]
 This release is based on upstream `master` (post-7.1.25) and therefore also
 includes upstream changes not yet part of a tagged upstream release.

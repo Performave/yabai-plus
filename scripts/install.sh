@@ -55,25 +55,29 @@ if [ ! -w "$MAN_DIR" ]; then
     exit 1
 fi
 
-AUTHOR="asmvik"
+AUTHOR="Performave"
+REPO="yabai-plus"
 NAME="yabai"
-VERSION="7.1.25"
-EXPECTED_HASH="76f383841570bfe1e3fd24cedd9b1a4b804b43b0f39c86a951c97d187fc6b1b4"
+VERSION="7.1.25-plus.2"
 TMP_DIR="./${AUTHOR}-${NAME}-v${VERSION}-installer"
+ARCHIVE="${NAME}-v${VERSION}.tar.gz"
+CHECKSUM="${ARCHIVE}.sha256"
 
-mkdir $TMP_DIR
-pushd $TMP_DIR
+mkdir "$TMP_DIR"
+cd "$TMP_DIR" || exit 1
 
-curl --location --remote-name https://github.com/${AUTHOR}/${NAME}/releases/download/v${VERSION}/${NAME}-v${VERSION}.tar.gz
-FILE_HASH=$(shasum -a 256 ./${NAME}-v${VERSION}.tar.gz | cut -d " " -f 1)
+curl --fail --location --remote-name "https://github.com/${AUTHOR}/${REPO}/releases/download/v${VERSION}/${ARCHIVE}"
+curl --fail --location --remote-name "https://github.com/${AUTHOR}/${REPO}/releases/download/v${VERSION}/${CHECKSUM}"
+FILE_HASH=$(shasum -a 256 "./${ARCHIVE}" | cut -d " " -f 1)
+EXPECTED_HASH=$(cut -d " " -f 1 "./${CHECKSUM}")
 
 if [ "$FILE_HASH" = "$EXPECTED_HASH" ]; then
     echo "Hash verified. Preparing files.."
-    tar -xzvf ${NAME}-v${VERSION}.tar.gz
-    rm ${BIN_DIR}/${NAME}
-    rm ${MAN_DIR}/${NAME}.1
-    cp -v ./archive/bin/${NAME} ${BIN_DIR}/${NAME}
-    cp -v ./archive/doc/${NAME}.1 ${MAN_DIR}/${NAME}.1
+    tar -xzvf "${ARCHIVE}"
+    rm "${BIN_DIR}/${NAME}"
+    rm "${MAN_DIR}/${NAME}.1"
+    cp -v "./archive/bin/${NAME}" "${BIN_DIR}/${NAME}"
+    cp -v "./archive/doc/${NAME}.1" "${MAN_DIR}/${NAME}.1"
     echo "Finished copying files.."
     echo ""
     echo "If you want yabai to be managed by launchd (start automatically upon login):"
@@ -95,5 +99,5 @@ else
     echo "  Actual hash: $FILE_HASH"
 fi
 
-popd
-rm -rf $TMP_DIR
+cd - >/dev/null || exit 1
+rm -rf "$TMP_DIR"

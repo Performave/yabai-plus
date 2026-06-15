@@ -75,7 +75,8 @@ which builds → Developer ID signs → notarizes → publishes a GitHub Release
 - **How to cut a release:** [docs/releasing.md](./docs/releasing.md)
 - **One-time CI/secret setup:** [docs/ci-setup.md](./docs/ci-setup.md)
 
-Versioning: `v<upstream-version>-plus.<n>` (e.g. `v7.1.25-plus.1`). Bump the
+Versioning: `v<upstream-version>-plus.<n>` (e.g. `v7.1.25-plus.1`). Release
+builds compile the pushed tag into `yabai --version`; bump the upstream fallback
 version macros in `src/yabai.c` and add a `CHANGELOG.md` entry before tagging.
 
 ## Conventions
