@@ -43,7 +43,19 @@ static void window_did_receive_focus(struct window_manager *wm, struct mouse_sta
     window_manager_set_window_opacity(wm, window, wm->active_window_opacity);
 
     if (wm->focused_window_id != window->id) {
-        if (ms->ffm_window_id != window->id) {
+        //
+        // NOTE(koekeishiya): Only warp the cursor between windows that are eligible
+        // for management. Auxiliary windows such as a Picture-in-Picture panel or a
+        // system dialog (e.g. AXSystemDialog) are not eligible and frequently steal
+        // and then return focus on their own. Warping the cursor onto such a window
+        // - or back off of it when it hands focus back to the previously active
+        // window - yanks it across the screen even though the user never initiated a
+        // focus change. Skipping these keeps mouse_follows_focus tied to real moves.
+        //
+        bool entering_eligible = window->is_eligible;
+        bool leaving_eligible  = !focused_window || focused_window->is_eligible;
+
+        if (ms->ffm_window_id != window->id && entering_eligible && leaving_eligible) {
             window_manager_center_mouse(wm, window);
         }
 
