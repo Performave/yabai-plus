@@ -107,10 +107,24 @@ shasum -a 256 "bin/${VERSION}.tar.gz"
 gh release create v7.1.25-plus.1 "bin/${VERSION}.tar.gz" --generate-notes
 ```
 
+## Homebrew tap
+
+Releases are published to the [`Performave/homebrew-tap`](https://github.com/Performave/homebrew-tap)
+tap as the `yabai-plus` formula:
+
+```bash
+brew install Performave/tap/yabai-plus
+```
+
+The release workflow's **Bump Homebrew tap formula** step updates the formula's
+`url`, `version`, and `sha256` automatically on every `v*` tag. It requires a
+`HOMEBREW_TAP_TOKEN` Actions secret — a token with `contents:write` on the tap
+repo (a fine-grained PAT scoped to `Performave/homebrew-tap` is enough). If the
+secret is absent the step is skipped (the release itself still succeeds), and you
+can bump the formula by hand.
+
 ## After releasing
 
-- If you maintain a Homebrew tap, update the formula/cask URL + sha256 to point at
-  the new release tarball.
 - `scripts/install.sh` carries a hard-coded `VERSION` + `EXPECTED_HASH` (upstream's
   curl installer). If you distribute via that script, run `make publish` to update
   those fields, or update them by hand.

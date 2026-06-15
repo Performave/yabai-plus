@@ -99,9 +99,12 @@ jobs:
           cp -r examples archive/
           tar -cvzf "bin/${VERSION}.tar.gz" archive
           rm -rf archive
+          SHA256="$(shasum -a 256 "bin/${VERSION}.tar.gz" | cut -d' ' -f1)"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tarball=bin/${VERSION}.tar.gz" >> "$GITHUB_OUTPUT"
-          shasum -a 256 "bin/${VERSION}.tar.gz"
+          echo "asset=${VERSION}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+          echo "Built ${VERSION}.tar.gz  sha256=${SHA256}"
 
       - name: Extract changelog notes
         id: notes
@@ -137,3 +140,48 @@ jobs:
           body_path: ${{ steps.notes.outputs.file }}
           # Fall back to auto-generated notes only if no changelog section was found.
           generate_release_notes: ${{ steps.notes.outputs.file == '' }}
+
+      - name: Bump Homebrew tap formula
+        # Updates Formula/yabai-plus.rb in Performave/homebrew-tap to point at the
+        # release just published. Requires a HOMEBREW_TAP_TOKEN secret (a token
+        # with contents:write on the tap repo); skipped if it isn't configured.
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          ASSET: ${{ steps.archive.outputs.asset }}
+          SHA256: ${{ steps.archive.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set; skipping tap bump."
+            exit 0
+          fi
+
+          TAP_REPO="Performave/homebrew-tap"
+          FORMULA="Formula/yabai-plus.rb"
+          PLUS_VERSION="${TAG#v}"   # v7.1.25-plus.1 -> 7.1.25-plus.1
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ASSET}"
+
+          git clone --depth 1 \
+            "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          cd tap
+
+          # macOS runner -> BSD sed. Replace only the top-level formula fields.
+          sed -i '' -E \
+            -e "s|^  url \".*\"|  url \"${URL}\"|" \
+            -e "s|^  version \".*\"|  version \"${PLUS_VERSION}\"|" \
+            -e "s|^  sha256 \".*\"|  sha256 \"${SHA256}\"|" \
+            "${FORMULA}"
+
+          echo "Updated ${FORMULA}:"
+          grep -E '^  (url|version|sha256) ' "${FORMULA}"
+
+          if git diff --quiet -- "${FORMULA}"; then
+            echo "Formula already up to date; nothing to commit."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "yabai-plus ${PLUS_VERSION}"
+          git push
