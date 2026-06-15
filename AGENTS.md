@@ -72,8 +72,8 @@ external dependency graph beyond the macOS SDK + frameworks. C standard is C11.
 Releases are automated: pushing a `v*` tag runs `.github/workflows/release.yml`,
 which builds → Developer ID signs → notarizes → publishes a GitHub Release.
 
-- **How to cut a release:** [docs/RELEASING.md](./docs/RELEASING.md)
-- **One-time CI/secret setup:** [docs/CI_SETUP.md](./docs/CI_SETUP.md)
+- **How to cut a release:** [docs/releasing.md](./docs/releasing.md)
+- **One-time CI/secret setup:** [docs/ci-setup.md](./docs/ci-setup.md)
 
 Versioning: `v<upstream-version>-plus.<n>` (e.g. `v7.1.25-plus.1`). Bump the
 version macros in `src/yabai.c` and add a `CHANGELOG.md` entry before tagging.

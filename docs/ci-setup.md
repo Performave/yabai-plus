@@ -44,7 +44,6 @@ names intentionally match the `easel` repo, so the same values can be reused.
 | --- | --- |
 | `APPLE_CERTIFICATE` | base64 of the `.p12`: `base64 -i cert.p12 \| pbcopy` |
 | `APPLE_CERTIFICATE_PASSWORD` | the password set when exporting the `.p12` |
-| `APPLE_KEYCHAIN_PASSWORD` | any random string (used for the temp CI keychain) |
 | `APPLE_SIGNING_IDENTITY` | full identity, e.g. `Developer ID Application: Your Name (TEAMID)` |
 | `APPLE_API_KEY` | App Store Connect **Key ID** |
 | `APPLE_API_ISSUER` | App Store Connect **Issuer ID** (a UUID) |
@@ -55,7 +54,6 @@ Scripting it instead of clicking:
 ```bash
 gh secret set APPLE_CERTIFICATE          < <(base64 -i cert.p12)
 gh secret set APPLE_CERTIFICATE_PASSWORD --body 'the-p12-password'
-gh secret set APPLE_KEYCHAIN_PASSWORD    --body "$(openssl rand -hex 16)"
 gh secret set APPLE_SIGNING_IDENTITY     --body 'Developer ID Application: Your Name (TEAMID)'
 gh secret set APPLE_API_KEY              --body 'ABC123DEF4'
 gh secret set APPLE_API_ISSUER           --body '00000000-0000-0000-0000-000000000000'
@@ -67,17 +65,17 @@ gh secret set APPLE_API_PRIVATE_KEY      < AuthKey_ABC123DEF4.p8
 These mirror a setup that's known to work and sidestep common notarization
 failures:
 
-- **`echo -n ... | base64 --decode -o`** when importing the cert — the `-n` and
-  `-o` avoid a trailing newline corrupting the `.p12`, a classic import failure.
+- **`apple-actions/import-codesign-certs`** for the cert import — it creates a
+  temporary `signing_temp` keychain, imports the `.p12`, and sets the key
+  partition list so `codesign` works non-interactively (the latter being a common
+  failure when done by hand on recent macOS runners).
 - **App Store Connect API key** rather than Apple-ID auth — no 2FA prompts in CI.
 - **`.p8` stored as raw text**, written with `printf` — avoids a base64
   round-trip getting mangled.
-- **`set-key-partition-list`** after import — on recent macOS runners, `codesign`
-  can fail non-interactively without it even when the key was imported with `-A`.
 
 ## 5. Verify
 
-1. Confirm all seven secrets exist (`gh secret list`).
+1. Confirm all six secrets exist (`gh secret list`).
 2. Trigger a run: either push a `v*` tag, or use the **workflow_dispatch** button
    on the Actions tab.
 3. Watch the **Notarize** step — `notarytool ... --wait` blocks until Apple
@@ -87,9 +85,8 @@ failures:
 
 | Symptom | Likely cause |
 | --- | --- |
-| `security import` fails | bad `APPLE_CERTIFICATE` base64 (re-export, use `base64 -i`) or wrong `.p12` password |
+| cert import step fails | bad `APPLE_CERTIFICATE` base64 (re-export, use `base64 -i`) or wrong `APPLE_CERTIFICATE_PASSWORD` |
 | `codesign` errors with "no identity found" | `APPLE_SIGNING_IDENTITY` doesn't match `security find-identity` output exactly |
-| `codesign` hangs / "User interaction is not allowed" | missing `set-key-partition-list` step |
 | notarytool `Invalid` | binary not signed with `--options runtime` / `--timestamp`, or signed with a non-Developer-ID cert |
 | notarytool auth error | wrong Key ID / Issuer ID, or the `.p8` text is incomplete |
 | Release not created | tag didn't match `v*`, or `contents: write` permission missing |

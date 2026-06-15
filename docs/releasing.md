@@ -5,7 +5,7 @@ automatically by the [`release` workflow](../.github/workflows/release.yml) when
 version tag is pushed. You should rarely need to build a release by hand.
 
 > One-time setup (Apple Developer account, GitHub secrets) lives in
-> [CI_SETUP.md](./CI_SETUP.md). Read that first if releases have never run on
+> [ci-setup.md](./ci-setup.md). Read that first if releases have never run on
 > this repo.
 
 ## TL;DR
