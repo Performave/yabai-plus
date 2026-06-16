@@ -2582,6 +2582,15 @@ static void window_manager_check_for_windows_on_space(struct window_manager *wm,
         struct window *window = window_manager_find_window(wm, window_list[i]);
         if (!window || !window_manager_should_manage_window(window)) continue;
 
+        //
+        // NOTE(plus): space_window_list() can transiently report a window that is mid-move
+        // between spaces/displays (e.g. while a space is being dragged across displays in
+        // Mission Control). Confirm the window is actually on this view's space before
+        // (re-)homing it here -- otherwise we yank an in-flight window into the wrong view
+        // and flush it onto the wrong display, where it sticks.
+        //
+        if (window_space(window->id) != view->sid) continue;
+
         struct view *existing_view = window_manager_find_managed_window(wm, window);
         if (existing_view && existing_view->layout != VIEW_FLOAT && existing_view != view) {
 
@@ -2641,6 +2650,17 @@ void window_manager_validate_and_check_for_windows_on_space(struct space_manager
     // This is necessary to make sure that we do not call the AX API for each modification to the tree.
     //
 
+    //
+    // NOTE(plus): A space dragged to another display in Mission Control keeps its managed id
+    // and its windows, but its view's cached frame still belongs to the old display. That
+    // change does NOT dirty the layout (no window is re-homed), so recompute the frame for the
+    // current display whenever the view is invalid -- view_update marks the view dirty, which
+    // makes the flush below actually reposition the windows onto the display the space now
+    // lives on. Without this the flush is skipped (dirty=0) and the windows are left at the old
+    // display's coordinates: the teleport.
+    //
+    if (space_is_visible(view->sid) && view_is_invalid(view)) view_update(view);
+
     if (space_is_visible(view->sid) && view_is_dirty(view)) {
         window_node_flush(view->root);
         view_clear_flag(view, VIEW_IS_DIRTY);
@@ -2666,6 +2686,13 @@ void window_manager_correct_for_mission_control_changes(struct space_manager *sm
         uint64_t sid = display_space_id(did);
         for (int j = 0; j < space_count; ++j) {
             if (space_list[j] == sid) {
+                //
+                // NOTE(plus): Invalidate the active space before validating it so a space that
+                // was just dragged onto this display recomputes its frame for the new display
+                // (see window_manager_validate_and_check_for_windows_on_space). Its managed id
+                // is unchanged by the move, so nothing else marks the cached frame stale.
+                //
+                space_manager_mark_view_invalid(sm, sid);
                 window_manager_validate_and_check_for_windows_on_space(sm, wm, sid);
             } else {
                 space_manager_mark_view_invalid(sm, space_list[j]);
