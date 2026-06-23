@@ -11,6 +11,26 @@ inherited from upstream.
 
 ## [Unreleased]
 
+## [7.1.25-plus.4]
+
+### Added (yabai-plus)
+- Add `--install-sudoers` and `--uninstall-sudoers` commands to manage a
+  passwordless `--load-sa` sudoers entry.
+- Add `manage` and `window_sublayer_auto` config keys for local control over
+  window management and automatic sublayer adjustments.
+
+### Changed (yabai-plus)
+- Harden the scripting-addition loader PAC ABI patch against partial writes.
+- Regenerate the installed man page and add icon generation to the release
+  workflow.
+- Document the yabai-plus backlog handoff process and Conventional Commit
+  requirement.
+
+### Fixed (yabai-plus)
+- Stop sticky or otherwise ineligible Arc Picture-in-Picture windows from
+  capturing focus during display or empty-space switches.
+- Gate automatic layer adjustment on `window_sublayer_auto`.
+
 ## [7.1.25-plus.3]
 
 ### Changed (yabai-plus)
