@@ -8,14 +8,14 @@ reconstructing context.
 
 - Status: Phase 0/1 done; Phase 3 client done; Phase 2 (pure core) largely done;
   Phase 4 (control plane) done; Phase 5 (macOS boundary) started. A
-  compatibility contract and non-invasive Cargo workspace
-  exist; the Rust `yabai -m` client talks to the live C daemon; the BSP layout
-  tree from `src/view.c` and the full `yabai -m` command grammar (all 7 domains)
-  are ported into pure-Rust `yabai-core`; `yabai-runtime` has the full control
-  plane (`AppState` + `Config` + `Runtime` flush + single-threaded `Actor`); and
-  `yabai-macos` has the first real `LayoutSink` (`AxSink`) moving windows via the
-  Accessibility API. 97 workspace tests pass. The shipped C `make` flow is
-  unchanged.
+  compatibility contract and non-invasive Cargo workspace exist; the Rust
+  `yabai -m` client talks to the live C daemon; the BSP layout tree from
+  `src/view.c` and the full `yabai -m` command grammar (all 7 domains) are
+  ported into pure-Rust `yabai-core`; `yabai-runtime` has the full control plane
+  (`AppState` + `Config` + `Runtime` flush + single-threaded `Actor`) plus the
+  first pure query serializer for state it owns; and `yabai-macos` has the first
+  real `LayoutSink` (`AxSink`) moving windows via the Accessibility API. 100
+  workspace tests pass. The shipped C `make` flow is unchanged.
 - Last updated: 2026-06-23.
 - User decisions captured:
   - The Rust rewrite may diverge permanently from upstream yabai. Rebaseability is no
@@ -231,13 +231,28 @@ without macOS or a daemon.
 - Whole workspace is now 97 passing tests; clippy/fmt clean; builds and links on
   `aarch64-apple-darwin`; client still talks to the live C daemon.
 
+- Added the first Rust query/read path in `yabai-runtime::AppState`. `Message::Query`
+  now handles the state the pure runtime actually owns: `query --windows` for
+  `id`, `frame`, and `has-focus`, plus `query --spaces` for `id`, `type`,
+  `windows`, `first-window`, `last-window`, `has-focus`, and `is-visible`. The
+  serializer deliberately emits C-style pretty JSON (`{\n\t...}` objects,
+  comma-separated arrays, four-decimal frames) and has golden tests for windows
+  and spaces. Unsupported properties such as `app`, and scopes requiring live
+  display/window metadata, fail explicitly rather than inventing values.
+- Scope note: numeric `--space` selectors currently resolve to the runtime space
+  id, not Mission Control index. That is acceptable for the pure state layer but
+  must be revisited when live display/space discovery lands.
+- Whole workspace is now 100 passing tests; `cargo fmt --all`, `cargo test
+  --workspace`, and `cargo clippy --workspace --all-targets` are clean.
+
 Next (rest of Phase 5): (1) the harder half — translate raw AX/SkyLight
 *callbacks* (app observers, window create/destroy/focus, space/display changes)
 into `StateEvent`s, including discovering each window's `AXUIElementRef` to
 `register` with the sink; (2) wire an `Actor<AxSink>` into a Rust daemon entry
 that owns the observers and a socket server (must NOT bind
 `/tmp/yabai_$USER.socket` while the C daemon runs — use a distinct path behind a
-flag); (3) JSON golden tests + a Rust query serializer to lock the read path.
+flag); (3) expand the Rust query serializer as live app/title/display/space
+metadata becomes available.
 
 ### 2026-06-23 (session 2)
 

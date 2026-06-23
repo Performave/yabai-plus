@@ -14,8 +14,8 @@
 use std::collections::HashMap;
 
 use yabai_core::{
-    Area, ConfigOp, Message, NodeSplit, Selector, SpaceAction, Tree, WindowAction, WindowFrame,
-    parse_message,
+    Area, ConfigOp, Message, NodeSplit, QueryCommand, QueryScopeKind, QueryTarget, Selector,
+    SpaceAction, Tree, ViewType, WindowAction, WindowFrame, parse_message,
 };
 
 use crate::config::Config;
@@ -223,9 +223,10 @@ impl AppState {
             Message::Config(cmd) => self.dispatch_config(&cmd.ops),
             Message::Window(cmd) => self.dispatch_window(&cmd.actions),
             Message::Space(cmd) => self.dispatch_space(&cmd.actions),
+            Message::Query(cmd) => self.dispatch_query(&cmd),
             // Domains whose effects need the macOS layers are accepted but not
             // yet enacted here; report them rather than silently succeeding.
-            Message::Display(_) | Message::Query(_) | Message::Rule(_) | Message::Signal(_) => {
+            Message::Display(_) | Message::Rule(_) | Message::Signal(_) => {
                 Err("domain not yet handled by AppState".to_string())
             }
         }
@@ -310,6 +311,183 @@ impl AppState {
         Ok(None)
     }
 
+    fn dispatch_query(&self, cmd: &QueryCommand) -> Response {
+        match cmd.target {
+            QueryTarget::Displays => Err("query --displays needs live display state".to_string()),
+            QueryTarget::Spaces => self.query_spaces(cmd),
+            QueryTarget::Windows => self.query_windows(cmd),
+        }
+    }
+
+    fn query_spaces(&self, cmd: &QueryCommand) -> Response {
+        let properties = query_properties(
+            &cmd.properties,
+            &[
+                "id",
+                "type",
+                "windows",
+                "first-window",
+                "last-window",
+                "has-focus",
+                "is-visible",
+            ],
+            "space",
+        )?;
+
+        match &cmd.scope {
+            Some((QueryScopeKind::Space, selector)) => {
+                let sid = self.resolve_space_selector(selector.as_ref())?;
+                let tree = self
+                    .spaces
+                    .get(&sid)
+                    .ok_or_else(|| "could not retrieve space details.".to_string())?;
+                Ok(Some(format!(
+                    "{}\n",
+                    self.serialize_space(sid, tree, &properties)
+                )))
+            }
+            None => {
+                let mut spaces = self.spaces.iter().collect::<Vec<_>>();
+                spaces.sort_by_key(|(sid, _)| *sid);
+                let mut output = String::from("[");
+                for (idx, (&sid, tree)) in spaces.into_iter().enumerate() {
+                    if idx > 0 {
+                        output.push(',');
+                    }
+                    output.push_str(&self.serialize_space(sid, tree, &properties));
+                }
+                output.push_str("]\n");
+                Ok(Some(output))
+            }
+            Some((QueryScopeKind::Display, _)) => {
+                Err("query --spaces --display needs live display state".to_string())
+            }
+            Some((QueryScopeKind::Window, _)) => {
+                Err("query --spaces --window needs live window state".to_string())
+            }
+        }
+    }
+
+    fn query_windows(&self, cmd: &QueryCommand) -> Response {
+        let properties =
+            query_properties(&cmd.properties, &["id", "frame", "has-focus"], "window")?;
+
+        match &cmd.scope {
+            Some((QueryScopeKind::Window, selector)) => {
+                let window_id = match selector.as_ref() {
+                    Some(selector) => self.resolve_window(selector)?,
+                    None => self.require_focused()?,
+                };
+                let frame = self
+                    .window_frame(window_id)
+                    .ok_or_else(|| "could not retrieve window details.".to_string())?;
+                Ok(Some(format!(
+                    "{}\n",
+                    self.serialize_window(frame, &properties)
+                )))
+            }
+            Some((QueryScopeKind::Space, selector)) => {
+                let sid = self.resolve_space_selector(selector.as_ref())?;
+                let frames = self
+                    .flush(sid)
+                    .ok_or_else(|| "could not retrieve windows for space.".to_string())?;
+                Ok(Some(self.serialize_window_array(&frames, &properties)))
+            }
+            None => {
+                let mut sids = self.spaces.keys().copied().collect::<Vec<_>>();
+                sids.sort_unstable();
+                let frames = sids
+                    .into_iter()
+                    .flat_map(|sid| self.flush(sid).unwrap_or_default())
+                    .collect::<Vec<_>>();
+                Ok(Some(self.serialize_window_array(&frames, &properties)))
+            }
+            Some((QueryScopeKind::Display, _)) => {
+                Err("query --windows --display needs live display state".to_string())
+            }
+        }
+    }
+
+    fn serialize_window_array(&self, frames: &[WindowFrame], properties: &[&str]) -> String {
+        let mut output = String::from("[");
+        for (idx, frame) in frames.iter().enumerate() {
+            if idx > 0 {
+                output.push(',');
+            }
+            output.push_str(&self.serialize_window(*frame, properties));
+        }
+        output.push_str("]\n");
+        output
+    }
+
+    fn serialize_space(&self, sid: u64, tree: &Tree, properties: &[&str]) -> String {
+        let windows = tree.window_list();
+        let mut fields = Vec::new();
+        for property in properties {
+            match *property {
+                "id" => fields.push(format!("\t\"id\":{sid}")),
+                "type" => fields.push(format!("\t\"type\":\"{}\"", view_type_str(tree.layout))),
+                "windows" => fields.push(format!("\t\"windows\":[{}]", join_ids(&windows))),
+                "first-window" => fields.push(format!(
+                    "\t\"first-window\":{}",
+                    windows.first().copied().unwrap_or(0)
+                )),
+                "last-window" => fields.push(format!(
+                    "\t\"last-window\":{}",
+                    windows.last().copied().unwrap_or(0)
+                )),
+                "has-focus" => fields.push(format!(
+                    "\t\"has-focus\":{}",
+                    json_bool(self.active_space == Some(sid))
+                )),
+                "is-visible" => fields.push(format!(
+                    "\t\"is-visible\":{}",
+                    json_bool(self.active_space == Some(sid))
+                )),
+                _ => unreachable!("query_properties rejects unsupported properties"),
+            }
+        }
+        format!("{{\n{}\n}}", fields.join(",\n"))
+    }
+
+    fn serialize_window(&self, frame: WindowFrame, properties: &[&str]) -> String {
+        let mut fields = Vec::new();
+        for property in properties {
+            match *property {
+                "id" => fields.push(format!("\t\"id\":{}", frame.window_id)),
+                "frame" => fields.push(format!(
+                    "\t\"frame\":{{\n\t\t\"x\":{:.4},\n\t\t\"y\":{:.4},\n\t\t\"w\":{:.4},\n\t\t\"h\":{:.4}\n\t}}",
+                    frame.area.x, frame.area.y, frame.area.w, frame.area.h
+                )),
+                "has-focus" => fields.push(format!(
+                    "\t\"has-focus\":{}",
+                    json_bool(self.focused_window == Some(frame.window_id))
+                )),
+                _ => unreachable!("query_properties rejects unsupported properties"),
+            }
+        }
+        format!("{{\n{}\n}}", fields.join(",\n"))
+    }
+
+    fn window_frame(&self, window_id: u32) -> Option<WindowFrame> {
+        self.spaces
+            .values()
+            .flat_map(Tree::capture)
+            .find(|frame| frame.window_id == window_id)
+    }
+
+    fn resolve_space_selector(&self, selector: Option<&Selector>) -> Result<u64, String> {
+        match selector {
+            Some(Selector::Index(id)) => Ok(u64::from(*id)),
+            Some(selector) => Err(format!(
+                "selector {selector:?} cannot be resolved without live space state"
+            )),
+            None => self
+                .active_space
+                .ok_or_else(|| "no active space".to_string()),
+        }
+    }
+
     fn require_focused(&self) -> Result<u32, String> {
         self.focused_window
             .ok_or_else(|| "no focused window".to_string())
@@ -380,11 +558,52 @@ impl AppState {
     }
 }
 
+fn query_properties<'a>(
+    requested: &'a [String],
+    default_properties: &'a [&'a str],
+    entity: &str,
+) -> Result<Vec<&'a str>, String> {
+    if requested.is_empty() {
+        return Ok(default_properties.to_vec());
+    }
+
+    let mut properties = Vec::with_capacity(requested.len());
+    for property in requested {
+        let property = property.as_str();
+        if default_properties.contains(&property) {
+            properties.push(property);
+        } else {
+            return Err(format!(
+                "'{property}' is not available from pure {entity} state"
+            ));
+        }
+    }
+    Ok(properties)
+}
+
+fn view_type_str(layout: ViewType) -> &'static str {
+    match layout {
+        ViewType::Bsp => "bsp",
+        ViewType::Stack => "stack",
+        ViewType::Float => "float",
+    }
+}
+
+fn join_ids(windows: &[u32]) -> String {
+    windows
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn json_bool(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yabai_core::ViewType;
-
     fn toks(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
     }
@@ -644,9 +863,53 @@ mod tests {
     }
 
     #[test]
+    fn query_windows_serializes_c_style_json() {
+        let mut state = state_with_space();
+        state.add_window(1).unwrap();
+        state.add_window(2).unwrap();
+        state.set_focused_window(Some(2));
+
+        assert_eq!(
+            state.handle_tokens(&toks(&["query", "--windows", "id,frame,has-focus"])),
+            Ok(Some(
+                "[{\n\t\"id\":1,\n\t\"frame\":{\n\t\t\"x\":0.0000,\n\t\t\"y\":0.0000,\n\t\t\"w\":500.0000,\n\t\t\"h\":1000.0000\n\t},\n\t\"has-focus\":false\n},{\n\t\"id\":2,\n\t\"frame\":{\n\t\t\"x\":500.0000,\n\t\t\"y\":0.0000,\n\t\t\"w\":500.0000,\n\t\t\"h\":1000.0000\n\t},\n\t\"has-focus\":true\n}]\n".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn query_spaces_serializes_supported_properties() {
+        let mut state = state_with_space();
+        state.add_window(1).unwrap();
+        state.add_window(2).unwrap();
+
+        assert_eq!(
+            state.handle_tokens(&toks(&[
+                "query",
+                "--spaces",
+                "id,type,windows,first-window,last-window,has-focus,is-visible",
+                "--space",
+                "1",
+            ])),
+            Ok(Some(
+                "{\n\t\"id\":1,\n\t\"type\":\"bsp\",\n\t\"windows\":[1, 2],\n\t\"first-window\":1,\n\t\"last-window\":2,\n\t\"has-focus\":true,\n\t\"is-visible\":true\n}\n".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn query_unsupported_property_reports() {
+        let mut state = state_with_space();
+        assert_eq!(
+            state.handle_tokens(&toks(&["query", "--windows", "app"])),
+            Err("'app' is not available from pure window state".to_string())
+        );
+    }
+
+    #[test]
     fn unhandled_domain_reports() {
         let mut state = AppState::new();
-        assert!(state.handle_tokens(&toks(&["query", "--windows"])).is_err());
+        assert!(state.handle_tokens(&toks(&["rule", "--list"])).is_err());
     }
 
     #[test]
