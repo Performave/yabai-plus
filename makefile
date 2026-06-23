@@ -78,7 +78,7 @@ $(BUILD_PATH)/yabai: $(YABAI_SRC)
 # file. Rebases onto upstream don't touch these lines -> no conflicts. Don't
 # fold any of this into the upstream targets above.
 # ============================================================================
-.PHONY: build release dev dev-restore sa-status
+.PHONY: build release test e2e dev dev-restore sa-status
 
 # Auto-detect the Developer ID signing identity from the keychain (overridable:
 # `make dev DEV_IDENTITY="..."`). Signing with a Developer ID keeps the binary's
@@ -103,6 +103,10 @@ DEV_SUDOERS    ?= /private/etc/sudoers.d/yabai
 # Friendly aliases for upstream's confusingly-named build targets.
 build: all       # debug build       -> bin/yabai (upstream: `all`)
 release: install # optimized -O3 build -> bin/yabai (upstream: `install`, installs nothing)
+test:
+	$(MAKE) -C tests
+e2e: $(BINS)
+	sh $(SCRIPT_PATH)/e2e-smoke.sh
 
 # Build, sign with the Developer ID (so the Accessibility grant + scripting-addition
 # trust carry over), swap into the Homebrew path in place, and restart the service.

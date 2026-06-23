@@ -16,6 +16,9 @@ typedef TEST_SIG(function);
 #define TEST_ENTRY(name) { #name, test_##name },
 #define TEST_LIST                                              \
     TEST_ENTRY(display_area_is_in_direction)                   \
+    TEST_ENTRY(area_max_point_uses_inclusive_bounds)           \
+    TEST_ENTRY(area_is_in_vertical_direction)                  \
+    TEST_ENTRY(area_make_pair_splits_with_gap)                 \
     TEST_ENTRY(closest_display_in_direction)
 
 static struct {
