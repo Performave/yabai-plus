@@ -100,6 +100,8 @@ jobs:
       - name: Apply Finder icon
         run: |
           set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/pyobjc-venv"
+          source "$RUNNER_TEMP/pyobjc-venv/bin/activate"
           python3 -m pip install pyobjc-framework-Cocoa >/dev/null
           make icon
 
