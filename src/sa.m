@@ -161,6 +161,9 @@ static bool macho_find_arm64e_caps(FILE *handle, uint8_t *caps, long *fat_caps_o
     *fat_caps_offset = -1;
     *mach_caps_offset = -1;
 
+    // NOTE(plus): only 32-bit fat (FAT_MAGIC, 0xCAFEBABE) is handled, not
+    // FAT_MAGIC_64 (0xCAFEBABF) with its 32-byte fat_arch_64 stride. Dock and the
+    // yabai loader are both 32-bit fat today; revisit if that ever changes.
     if (magic == MACHO_FAT_MAGIC) {
         uint32_t arch_count;
         if (!macho_read_u32_be(handle, 4, &arch_count)) return false;
@@ -229,19 +232,47 @@ static bool scripting_addition_patch_loader_pac_abi(bool *patched)
     long fat_caps_offset, mach_caps_offset;
     bool loader_result = macho_find_arm64e_caps(loader, &loader_caps, &fat_caps_offset, &mach_caps_offset);
     if (!loader_result) goto err;
-    if (loader_caps == dock_caps) goto out;
+
+    // NOTE(plus): the fat and mach-header capability bytes are independent on
+    // disk, so decide "needs patch" from *both* (not just the fat byte the finder
+    // returns) -- otherwise a prior partial write that left them out of sync would
+    // be read as already-correct and never repaired. Then write the mach byte
+    // first and the fat byte last: the fat byte is what macho_find_arm64e_caps
+    // keys on for a fat binary, so writing it last means an interrupted patch
+    // leaves the fat byte stale and is re-detected on the next run.
+    bool needs_patch = false;
 
     if (fat_caps_offset != -1) {
         if (fseek(loader, fat_caps_offset, SEEK_SET) != 0) goto err;
-        if (fputc(dock_caps, loader) == EOF) goto err;
+        int byte = fgetc(loader);
+        if (byte == EOF) goto err;
+        if ((uint8_t) byte != dock_caps) needs_patch = true;
     }
+
+    if (mach_caps_offset != -1) {
+        if (fseek(loader, mach_caps_offset, SEEK_SET) != 0) goto err;
+        int byte = fgetc(loader);
+        if (byte == EOF) goto err;
+        if ((uint8_t) byte != dock_caps) needs_patch = true;
+    }
+
+    if (!needs_patch) goto out;
 
     if (mach_caps_offset != -1) {
         if (fseek(loader, mach_caps_offset, SEEK_SET) != 0) goto err;
         if (fputc(dock_caps, loader) == EOF) goto err;
     }
 
+    if (fat_caps_offset != -1) {
+        if (fseek(loader, fat_caps_offset, SEEK_SET) != 0) goto err;
+        if (fputc(dock_caps, loader) == EOF) goto err;
+    }
+
+    // A buffered-write error can surface only at close, so a failed fclose here
+    // means the patch may not have hit disk -- report it instead of returning ok.
+    if (fclose(loader) != 0) return false;
     *patched = true;
+    return true;
 
 out:
     fclose(loader);
@@ -262,7 +293,11 @@ static void scripting_addition_prepare_binaries(void)
 
 #ifdef __arm64__
     bool loader_patched;
-    scripting_addition_patch_loader_pac_abi(&loader_patched);
+    if (!scripting_addition_patch_loader_pac_abi(&loader_patched)) {
+        warn("yabai: scripting-addition failed to normalize loader arm64e PAC ABI!\n");
+    }
+    // NOTE(plus): codesign runs unconditionally below regardless of loader_patched,
+    // since the loader bytes were just (re)written from the embedded payload anyway.
 #endif
 
     snprintf(cmd, sizeof(cmd), "%s %s %s", "codesign -f -s -", osax_bin_loader, "2>/dev/null");

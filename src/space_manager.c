@@ -685,6 +685,12 @@ void space_manager_move_window_list_to_space(uint64_t sid, uint32_t *window_list
 
 void space_manager_move_window_to_space(uint64_t sid, struct window *window)
 {
+    // NOTE(plus): prefer the scripting-addition path for single-window moves when
+    // SA is loaded -- it avoids the visible cross-display flash of the async
+    // bridged operation. Returns false (and falls through to the SLS paths below)
+    // when SA is not loaded, so behaviour is preserved without it. The multi-window
+    // space_manager_move_window_list_to_space() above intentionally keeps the
+    // upstream ordering and is not changed here.
     if (scripting_addition_move_window_to_space(sid, window->id)) {
         return;
     } else if (SLSPerformAsynchronousBridgedWindowManagementOperation) {
