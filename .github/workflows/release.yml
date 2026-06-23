@@ -98,7 +98,10 @@ jobs:
           # notarization ticket online on first run, which is sufficient.
 
       - name: Apply Finder icon
-        run: make icon
+        run: |
+          set -euo pipefail
+          python3 -m pip install pyobjc-framework-Cocoa >/dev/null
+          make icon
 
       - name: Assemble archive
         id: archive
