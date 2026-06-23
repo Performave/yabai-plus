@@ -14,7 +14,7 @@ reconstructing context.
   ported into pure-Rust `yabai-core`; `yabai-runtime` has the full control plane
   (`AppState` + `Config` + `Runtime` flush + single-threaded `Actor`) plus the
   first pure query serializer for windows/spaces/displays; and `yabai-macos` has
-  the first real `LayoutSink` (`AxSink`) moving windows via the Accessibility API. 102
+  the first real `LayoutSink` (`AxSink`) moving windows via the Accessibility API. 103
   workspace tests pass. The shipped C `make` flow is unchanged.
 - Last updated: 2026-06-23.
 - User decisions captured:
@@ -258,6 +258,18 @@ without macOS or a daemon.
   Mission Control indices, for the same reason as the prior `--space` selector
   note. UUIDs/labels still require live macOS metadata and remain unsupported.
 - Whole workspace is now 102 passing tests; `cargo fmt --all`, `cargo test
+  --workspace`, and `cargo clippy --workspace --all-targets` are clean.
+
+- Added a safe dry-run Rust daemon entry in `crates/yabai`: the new
+  `--experimental-rust-daemon <socket>` flag binds only the caller-provided
+  socket path (it never uses `/tmp/yabai_$USER.socket` implicitly), starts an
+  `Actor<RecordingSink>`, decodes the existing C-compatible IPC framing, and
+  returns actor responses with the same `FAILURE_MARKER` convention as the C
+  daemon/client pair. This is intentionally not the real macOS daemon yet: it has
+  no observers and no `AxSink`, but it exercises the socket -> actor -> response
+  loop behind a non-conflicting flag. Added an in-process Unix-socket test that
+  sends `query --windows id` through the daemon path and receives `[]\n`.
+- Whole workspace is now 103 passing tests; `cargo fmt --all`, `cargo test
   --workspace`, and `cargo clippy --workspace --all-targets` are clean.
 
 Next (rest of Phase 5): (1) the harder half — translate raw AX/SkyLight
