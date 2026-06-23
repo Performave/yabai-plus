@@ -1,4 +1,5 @@
 extern struct window_manager g_window_manager;
+extern struct process_manager g_process_manager;
 extern int g_connection;
 
 static TABLE_HASH_FUNC(hash_view)
@@ -1008,6 +1009,16 @@ enum space_op_error space_manager_focus_space(uint64_t sid)
     if (scripting_addition_focus_space(sid)) {
         if (focus_display) {
             display_manager_focus_display(new_did, sid);
+        } else if (!window_manager_find_focusable_window_on_space(&g_window_manager, sid)) {
+            //
+            // NOTE(yabai-plus): a same-display switch only swaps the visible space; it never
+            // changes the frontmost application. If the destination space has no focusable
+            // window (sticky windows like an Arc PiP are skipped), the previously frontmost app
+            // keeps its key window on the old space, so macOS bounces us straight back to that
+            // space. Drop the front process to Finder with no key window -- the same idiom used
+            // when a focused window is destroyed -- so we land on the empty desktop instead.
+            //
+            _SLPSSetFrontProcessWithOptions(&g_process_manager.finder_psn, 0, kCPSNoWindows);
         }
     } else {
         space_manager_focus_space_using_gesture(new_did, sid);

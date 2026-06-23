@@ -462,7 +462,7 @@ void display_manager_set_active_display_id(uint32_t did)
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 void display_manager_focus_display(uint32_t did, uint64_t sid)
 {
-    struct window *window = window_manager_find_window_on_space_by_rank_filtering_window(&g_window_manager, sid, 1, 0);
+    struct window *window = window_manager_find_focusable_window_on_space(&g_window_manager, sid);
     if (window) {
         window_manager_focus_window_with_raise(&window->application->psn, window->id, window->ref);
         window_manager_center_mouse(&g_window_manager, window);

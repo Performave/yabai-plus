@@ -977,6 +977,34 @@ struct window *window_manager_find_window_on_space_by_rank_filtering_window(stru
     return result;
 }
 
+struct window *window_manager_find_focusable_window_on_space(struct window_manager *wm, uint64_t sid)
+{
+    int count;
+    uint32_t *window_list = space_window_list(sid, &count, false);
+    if (!window_list) return NULL;
+
+    struct window *result = NULL;
+    for (int i = 0; i < count; ++i) {
+        struct window *window = window_manager_find_window(wm, window_list[i]);
+        if (!window) continue;
+
+        //
+        // NOTE(yabai-plus): skip sticky windows (they live on every space, e.g.
+        // a sticky Arc PiP) and otherwise-ineligible windows so cross-display
+        // focus lands on a window actually homed on the target space rather than
+        // capturing the topmost sticky overlay.
+        //
+
+        if (!window_manager_is_window_eligible(window)) continue;
+        if (window_is_sticky(window->id))               continue;
+
+        result = window;
+        break;
+    }
+
+    return result;
+}
+
 static inline bool window_manager_window_connection_is_jankyborders(int window_cid)
 {
     static char process_name[PROC_PIDPATHINFO_MAXSIZE];
