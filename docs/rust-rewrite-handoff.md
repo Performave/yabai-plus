@@ -455,13 +455,26 @@ without macOS or a daemon.
   Verified live: launching Calculator under `all` never appeared (stayed 10 apps
   across 3 ticks). The fix is a `CGWindowListCopyWindowInfo`-based pid scan (it
   refreshes without a run loop) — documented in the `Tick` handler and deferred.
+- **`CGWindowList` discovery** (`cgwindow.rs`) — fixes the new-app gap above.
+  `CGWindowListCopyWindowInfo` reflects current on-screen windows on every call
+  (no run loop needed) and reads only owner pid / window number / layer (never
+  `kCGWindowName`, so no Screen Recording permission). `on_screen_windows()` ->
+  `CgWindow { window_id, pid }` for normal (layer 0) windows;
+  `application_pids_with_windows()` -> distinct owner pids. The WM daemon now uses
+  it for `all`-mode initial discovery *and* in the tick, so apps launched after
+  startup are observed and tiled.
+- Live verification: started the WM daemon in `all` mode (3 apps with on-screen
+  windows, 8 windows), launched Calculator, and within one 3s tick the count rose
+  to 9 with Calculator tiled (its window moved to the computed slot, clamped to
+  its fixed 198×350 size). Confirms live app pickup works.
 - Whole workspace is still 105 passing tests; `cargo fmt`/`test`/`clippy` clean.
 
-Next (rest of Phase 5): (1) `CGWindowList`-based app/window discovery so the WM
-daemon picks up apps launched after startup (replaces the run-loop-dependent
-`NSWorkspace` snapshot for the live path). (2) Expand the Rust query serializer
-as live app/title/display/space metadata becomes available. (3) Multi-display:
-the daemon currently tiles only the first display's visible frame into one space.
+Next (rest of Phase 5): (1) Expand the Rust query serializer as live
+app/title/display/space metadata becomes available (app name/title need an AX
+read per window; CG ids already resolve). (2) Multi-display: the daemon currently
+tiles only the first display's visible frame into one space. (3) Observe app
+*termination* to drop a whole app's windows promptly (the tick reconcile already
+catches it within 3s as a backstop).
 
 ### 2026-06-23 (session 2)
 

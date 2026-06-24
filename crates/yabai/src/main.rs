@@ -10,10 +10,10 @@ use yabai_core::Area;
 use yabai_ipc::{FAILURE_MARKER, daemon_socket_path, decode_client_payload, send_message};
 use yabai_macos::ax::DiscoveredAxWindow;
 use yabai_macos::{
-    AxSink, ObservedEvent, accessibility_trusted_with_prompt, active_displays, focused_window,
-    focused_window_diagnostics, main_visible_frame, move_focused_window, move_pid_window,
-    observe_pid, regular_application_pids, tileable_pid_windows, windows_for_pid,
-    windows_for_pid_diagnostics,
+    AxSink, ObservedEvent, accessibility_trusted_with_prompt, active_displays,
+    application_pids_with_windows, focused_window, focused_window_diagnostics, main_visible_frame,
+    move_focused_window, move_pid_window, observe_pid, regular_application_pids,
+    tileable_pid_windows, windows_for_pid, windows_for_pid_diagnostics,
 };
 use yabai_runtime::{Actor, AppState, LayoutSink, RecordingSink, Response, Runtime, StateEvent};
 
@@ -671,8 +671,10 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let pids: Vec<i32> = if target == "all" {
-        regular_application_pids()
+    let is_all = target == "all";
+    let pids: Vec<i32> = if is_all {
+        // CGWindowList reflects current on-screen windows and refreshes live.
+        application_pids_with_windows()
     } else if let Ok(pid) = target.parse::<i32>() {
         vec![pid]
     } else {
@@ -772,12 +774,17 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
         match work {
             WmWork::Observed(event) => reconcile_pid(&mut runtime, &mut managed, event.pid()),
             WmWork::Tick => {
+                // In `all` mode, pick up apps launched after startup via the live
+                // CGWindowList scan, and start observing each.
+                if is_all {
+                    for pid in application_pids_with_windows() {
+                        if observed.insert(pid) {
+                            spawn_observer(pid, &tx);
+                        }
+                    }
+                }
                 // Self-heal: re-reconcile every known app, catching any window
                 // change an observer missed (e.g. the unreliable AX destroy).
-                // NOTE: apps *launched* after startup are not discovered here —
-                // `NSWorkspace.runningApplications` does not refresh without a
-                // pumped main run loop, which this event loop deliberately lacks.
-                // Picking up new apps needs a `CGWindowList`-based scan (future).
                 for pid in observed.iter().copied().collect::<Vec<_>>() {
                     reconcile_pid(&mut runtime, &mut managed, pid);
                 }

@@ -3,6 +3,8 @@
 #[cfg(target_os = "macos")]
 pub mod ax;
 #[cfg(target_os = "macos")]
+pub mod cgwindow;
+#[cfg(target_os = "macos")]
 pub mod display;
 #[cfg(target_os = "macos")]
 pub mod objc;
@@ -20,6 +22,8 @@ pub use ax::{
     move_focused_window, move_pid_window, tileable_pid_windows, windows_for_pid,
     windows_for_pid_diagnostics,
 };
+#[cfg(target_os = "macos")]
+pub use cgwindow::{CgWindow, application_pids_with_windows, on_screen_windows};
 #[cfg(target_os = "macos")]
 pub use display::{MacDisplay, active_displays};
 #[cfg(target_os = "macos")]
