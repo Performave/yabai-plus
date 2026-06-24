@@ -11,6 +11,22 @@ inherited from upstream.
 
 ## [Unreleased]
 
+## [7.1.25-plus.5]
+
+### Changed (yabai-plus)
+- Document the release process requirement to verify that the changelog heading
+  matches the release tag and accurately describes the included commits.
+
+### Fixed (yabai-plus)
+- Respect `config manage off` during startup window import so existing windows
+  are not tiled/resized before the asynchronous config run disables management.
+- Allow explicit `window --toggle float` commands to re-tile a floating window
+  even when automatic management is disabled globally.
+- Ignore zero-area windows when deciding whether to manage a window, preventing
+  invisible `0x0` windows from reserving phantom BSP slots.
+- Fix release icon generation in CI by installing PyObjC in an isolated virtual
+  environment.
+
 ## [7.1.25-plus.4]
 
 ### Added (yabai-plus)
