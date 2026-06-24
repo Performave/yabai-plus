@@ -11,9 +11,10 @@ use yabai_ipc::{FAILURE_MARKER, daemon_socket_path, decode_client_payload, send_
 use yabai_macos::ax::DiscoveredAxWindow;
 use yabai_macos::{
     AxSink, ObservedEvent, accessibility_trusted_with_prompt, active_displays,
-    application_pids_with_windows, focused_window, focused_window_diagnostics, main_visible_frame,
-    move_focused_window, move_pid_window, observe_pid, regular_application_pids,
-    tileable_pid_windows, windows_for_pid, windows_for_pid_diagnostics,
+    application_pids_with_windows, current_space_for_display, focused_window,
+    focused_window_diagnostics, main_visible_frame, move_focused_window, move_pid_window,
+    observe_pid, regular_application_pids, spaces_for_display, tileable_pid_windows,
+    windows_for_pid, windows_for_pid_diagnostics,
 };
 use yabai_runtime::{
     Actor, AppState, LayoutSink, RecordingSink, Response, Runtime, StateEvent, WindowMeta,
@@ -716,15 +717,36 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
         }
     };
     let usable = main_visible_frame().unwrap_or(display.frame);
+    let current_sid = match current_space_for_display(display.id) {
+        Ok(sid) => sid,
+        Err(error) => {
+            eprintln!("yabai-rust: failed to discover current space: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut display_spaces = match spaces_for_display(display.id) {
+        Ok(spaces) => spaces,
+        Err(error) => {
+            eprintln!("yabai-rust: failed to discover display spaces: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if !display_spaces.contains(&current_sid) {
+        display_spaces.push(current_sid);
+    }
 
     let mut state = AppState::new();
     state.add_display(display.id, display.frame);
-    state.add_space_to_display(1, display.id, usable);
-    state.set_active_space(1);
+    for sid in &display_spaces {
+        state.add_space_to_display(*sid, display.id, usable);
+    }
+    state.set_active_space(current_sid);
     let _ = state.handle_tokens(&tile_config_tokens(gap, padding));
-    if let Err(error) = state.set_space_frame(1, usable) {
-        eprintln!("yabai-rust: failed to apply padding: {error}");
-        return ExitCode::from(1);
+    for sid in &display_spaces {
+        if let Err(error) = state.set_space_frame(*sid, usable) {
+            eprintln!("yabai-rust: failed to apply padding to space {sid}: {error}");
+            return ExitCode::from(1);
+        }
     }
 
     let mut runtime = Runtime::new(state, AxSink::new());
@@ -775,8 +797,10 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
 
     // The main thread keeps `tx` alive, so the loop runs until the process dies.
     eprintln!(
-        "yabai-rust: WM daemon up on {socket_path} — target {target}, {} app(s), {initial} window(s), gap {gap}, padding {padding}",
-        pids.len()
+        "yabai-rust: WM daemon up on {socket_path} — target {target}, {} app(s), {initial} window(s), display {}, active space {current_sid}, {} discovered space(s), gap {gap}, padding {padding}",
+        pids.len(),
+        display.id,
+        display_spaces.len()
     );
     eprintln!(
         "yabai-rust: tracking live window changes; send commands with a matching USER (e.g. USER=<name> yabai -m space --rotate 90)"

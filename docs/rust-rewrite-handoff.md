@@ -835,7 +835,7 @@ chronological log and may describe earlier states.
     `Message`. `ParseError` `Display` text matches the C `daemon_fail` strings.
 - `crates/yabai-ipc` (6 tests) — client wire framing + `send_message`; the
   `crates/yabai` binary `-m` path uses it and talks to the live C daemon.
-- `crates/yabai-runtime` (27 tests) — the control plane, depends on `yabai-core`:
+- `crates/yabai-runtime` (28 tests) — the control plane, depends on `yabai-core`:
   - `config.rs`: `Config` (all settable keys) + get/set + `layout_config()`.
   - `app_state.rs`: `AppState` (config, `sid -> Tree`, active space, focused
     window). `handle_tokens`/`dispatch` apply messages; `handle_event` applies a
@@ -846,9 +846,9 @@ chronological log and may describe earlier states.
     mutation.
   - `actor.rs`: `Actor<S>` = a thread owning a `Runtime`, fed serialized work
     (`post_event`, blocking `message`, `shutdown` returns the `Runtime`).
-- `crates/yabai-macos` (4 tests) — Phase 5 boundary, depends on runtime+core.
+- `crates/yabai-macos` (5 tests) — Phase 5 boundary, depends on runtime+core.
   Modules: `ax.rs`, `screen.rs`, `objc.rs`, `workspace.rs`, `cgwindow.rs`,
-  `observe.rs`, `display.rs`:
+  `observe.rs`, `display.rs`, `space.rs`:
   - `ax.rs`: `AxSink` impl of `LayoutSink` moving windows via AX
     (`kAXPosition`/`kAXSize`); `AxWindow` RAII over `AXUIElementRef`; local
     CF/ApplicationServices FFI. Builds/links on macOS. Also AX diagnostics
@@ -869,6 +869,9 @@ chronological log and may describe earlier states.
     `ObservedEvent`s over a channel (`WindowCreated`/`Destroyed`/
     `FocusedWindowChanged`). NOTE: `AXUIElementDestroyed` is unreliable; use set
     reconciliation, not the notification.
+  - `space.rs`: read-only SkyLight discovery for `current_space_for_display()`
+    (`SLSManagedDisplayGetCurrentSpace`) and `spaces_for_display()`
+    (`SLSCopyManagedDisplaySpaces` + `id64` extraction).
 - `crates/yabai-osax-common`, `-osax-legacy`, `-sa` — still scaffolding/constants.
 
 THE LIVE WM DAEMON (in `crates/yabai/src/main.rs`):
@@ -880,21 +883,25 @@ self-heal `Tick`, (c) a socket-acceptor thread. `reconcile_pid` re-discovers an
 app's tileable windows on each event, registers newcomers / drops vanished ones
 (robust to the unreliable AX destroy), sets `app`/`title`/`pid` metadata, and
 re-flows. Verified live: auto-tile on open, auto-reconcile on close, new-app
-pickup via CGWindowList, `space --rotate/--balance` over the socket, and
-`query --windows id,app,title` returning real values.
+pickup via CGWindowList, real active-space id discovery at startup, per-space
+trees for the first display's discovered spaces, `space --rotate/--balance` over
+the socket, and `query --windows id,app,title` returning real values.
 
 Other experimental flags in `main.rs`: `--experimental-ax-{focused-window,debug,
 windows-for-pid,pid-debug,move-focused,move-pid,tile-pid,observe-pid}`,
 `--experimental-rust-{daemon,tile-daemon}` (the tile-daemon is the older
 snapshot-only `Actor<AxSink>` version; the wm-daemon supersedes it).
 
-End-to-end today: a real dynamic tiling WM for the first display / one space,
-driven entirely by the pure core. Single-display, single-space only.
+End-to-end today: a real dynamic tiling WM for the first display / active space,
+driven entirely by the pure core. It seeds real space ids for the first display,
+but does not yet handle live space-change events or route windows by their actual
+space. Single-display, active-space tiling only.
 
 ### Do these next, in order (Phase 5/6 breadth — the big remaining work)
 
-1. Multi-space + Mission Control: discover spaces (SkyLight), per-space trees,
-   `--space` focus/move, space create/destroy. Highest-value next step.
+1. Multi-space + Mission Control: space discovery + startup per-space trees now
+   exist for the first display; next add live space-change events, window-to-space
+   assignment/routing, `--space` focus/move, and space create/destroy.
 2. Multi-display: the WM daemon tiles only `active_displays().next()` today; add
    per-display spaces and route windows to the display they're on.
 3. App-termination handling (drop a whole app's windows promptly; the 3s tick is
@@ -919,7 +926,7 @@ driven entirely by the pure core. Single-display, single-space only.
   block needs a `// SAFETY:` comment. `cargo fmt` reorders `use` lists
   (types/fns interleaved alphabetically); let it, then match its output.
 - Verify each step with `cargo fmt --all && cargo clippy --workspace
-  --all-targets && cargo test --workspace`. Currently 106 tests, clippy clean.
+  --all-targets && cargo test --workspace`. Currently 107 tests, clippy clean.
 - The live WM daemon binds only a caller-supplied socket; to message it use a
   socket named `/tmp/yabai_<name>.socket` and query with `USER=<name>`. Always
   `pkill -f experimental-rust-wm-daemon` to stop it (each shell call is a fresh

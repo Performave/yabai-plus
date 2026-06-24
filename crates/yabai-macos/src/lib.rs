@@ -13,6 +13,8 @@ pub mod observe;
 #[cfg(target_os = "macos")]
 pub mod screen;
 #[cfg(target_os = "macos")]
+pub mod space;
+#[cfg(target_os = "macos")]
 pub mod workspace;
 
 #[cfg(target_os = "macos")]
@@ -30,6 +32,8 @@ pub use display::{MacDisplay, active_displays};
 pub use observe::{ObservedEvent, observe_pid};
 #[cfg(target_os = "macos")]
 pub use screen::main_visible_frame;
+#[cfg(target_os = "macos")]
+pub use space::{current_space_for_display, spaces_for_display};
 #[cfg(target_os = "macos")]
 pub use workspace::regular_application_pids;
 

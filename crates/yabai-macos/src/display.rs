@@ -1,7 +1,7 @@
 //! Live display discovery through CoreGraphics.
 //!
 //! This is intentionally a narrow Phase 5 boundary: it discovers display ids and
-//! frames, leaving spaces, labels, and UUIDs to later SkyLight/CoreGraphics work.
+//! frames, while `space.rs` handles the current read-only SkyLight space slice.
 
 #![cfg(target_os = "macos")]
 
