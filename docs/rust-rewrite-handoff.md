@@ -888,8 +888,9 @@ app's tileable windows on each event, registers newcomers / drops vanished ones
 re-flows. Verified live: auto-tile on open, auto-reconcile on close, new-app
 pickup via CGWindowList, real active-space id discovery at startup, per-space
 trees for the first display's discovered spaces, window-to-space assignment
-routing during reconciliation, `space --rotate/--balance` over the socket, and
-`query --windows id,app,title` returning real values.
+routing during reconciliation, active-space refresh from SkyLight before
+observed events/ticks/socket messages, `space --rotate/--balance` over the
+socket, and `query --windows id,app,title` returning real values.
 
 Other experimental flags in `main.rs`: `--experimental-ax-{focused-window,debug,
 windows-for-pid,pid-debug,move-focused,move-pid,tile-pid,observe-pid}`,
@@ -899,14 +900,15 @@ snapshot-only `Actor<AxSink>` version; the wm-daemon supersedes it).
 End-to-end today: a real dynamic tiling WM for the first display / active space,
 driven entirely by the pure core. It seeds real space ids for the first display
 and routes discovered windows to their reported spaces, but does not yet handle
-live space-change events. Single-display, active-space tiling only.
+subscribed live space-change events (it polls current space before daemon work).
+Single-display, active-space tiling only.
 
 ### Do these next, in order (Phase 5/6 breadth — the big remaining work)
 
 1. Multi-space + Mission Control: space discovery, startup per-space trees, and
-   window-to-space assignment/routing now exist for the first display; next add
-   live space-change events, active-space switching, `--space` focus/move, and
-   space create/destroy.
+   window-to-space assignment/routing now exist for the first display; active
+   space is refreshed by polling before daemon work. Next add subscribed live
+   space-change events, `--space` focus/move, and space create/destroy.
 2. Multi-display: the WM daemon tiles only `active_displays().next()` today; add
    per-display spaces and route windows to the display they're on.
 3. App-termination handling (drop a whole app's windows promptly; the 3s tick is
