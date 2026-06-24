@@ -20,6 +20,29 @@ type CFAllocatorRef = *const c_void;
 type CFIndex = isize;
 type Boolean = u8;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGRect {
+    origin: CGPoint,
+    size: CGSize,
+}
+
+// `kCFNumberSInt32Type` from <CoreFoundation/CFNumber.h>.
+const K_CF_NUMBER_SINT32_TYPE: i32 = 3;
 // `kCFNumberSInt64Type` from <CoreFoundation/CFNumber.h>.
 const K_CF_NUMBER_SINT64_TYPE: i32 = 4;
 // `kCFStringEncodingUTF8`.
@@ -50,10 +73,21 @@ unsafe extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
+    fn CFArrayCreate(
+        allocator: CFAllocatorRef,
+        values: *const *const c_void,
+        num_values: CFIndex,
+        callbacks: *const c_void,
+    ) -> CFArrayRef;
     fn CFArrayGetCount(the_array: CFArrayRef) -> CFIndex;
     fn CFArrayGetValueAtIndex(the_array: CFArrayRef, idx: CFIndex) -> CFTypeRef;
     fn CFDictionaryGetValue(dict: CFDictionaryRef, key: *const c_void) -> *const c_void;
     fn CFEqual(cf1: CFTypeRef, cf2: CFTypeRef) -> Boolean;
+    fn CFNumberCreate(
+        allocator: CFAllocatorRef,
+        the_type: i32,
+        value_ptr: *const c_void,
+    ) -> CFNumberRef;
     fn CFNumberGetValue(number: CFNumberRef, the_type: i32, value_ptr: *mut c_void) -> Boolean;
     fn CFRelease(cf: CFTypeRef);
     fn CFStringCreateWithCString(
@@ -67,8 +101,12 @@ unsafe extern "C" {
 #[link(name = "SkyLight", kind = "framework")]
 unsafe extern "C" {
     fn SLSMainConnectionID() -> i32;
+    fn SLSCopyBestManagedDisplayForRect(cid: i32, rect: CGRect) -> CFStringRef;
+    fn SLSCopyManagedDisplayForWindow(cid: i32, wid: u32) -> CFStringRef;
     fn SLSManagedDisplayGetCurrentSpace(cid: i32, uuid: CFStringRef) -> u64;
     fn SLSCopyManagedDisplaySpaces(cid: i32) -> CFArrayRef;
+    fn SLSCopySpacesForWindows(cid: i32, selector: i32, window_list: CFArrayRef) -> CFArrayRef;
+    fn SLSGetWindowBounds(cid: i32, wid: u32, frame: *mut CGRect) -> i32;
 }
 
 fn owned_cfstring(literal: &[u8]) -> io::Result<OwnedCf> {
@@ -131,6 +169,72 @@ fn cfnumber_u64(number: CFNumberRef) -> Option<u64> {
         )
     };
     (ok != 0 && value > 0).then_some(value as u64)
+}
+
+fn owned_cfnumber_i32(value: i32) -> io::Result<OwnedCf> {
+    // SAFETY: `value` is a valid out-of-line scalar for CoreFoundation to copy
+    // into an owned CFNumber.
+    let number = unsafe {
+        CFNumberCreate(
+            std::ptr::null(),
+            K_CF_NUMBER_SINT32_TYPE,
+            &value as *const i32 as *const c_void,
+        )
+    };
+    if number.is_null() {
+        Err(io::Error::other("failed to create CoreFoundation number"))
+    } else {
+        Ok(OwnedCf(number))
+    }
+}
+
+fn owned_single_value_array(value: &OwnedCf) -> io::Result<OwnedCf> {
+    let values = [value.as_ptr()];
+    // SAFETY: `values` points to one valid CF object for the duration of the
+    // call. Null callbacks mirror the narrow C helper usage here; the caller
+    // keeps `value` alive while the array is used.
+    let array = unsafe { CFArrayCreate(std::ptr::null(), values.as_ptr(), 1, std::ptr::null()) };
+    if array.is_null() {
+        Err(io::Error::other("failed to create CoreFoundation array"))
+    } else {
+        Ok(OwnedCf(array))
+    }
+}
+
+fn window_display_uuid(window_id: u32) -> Option<OwnedCf> {
+    // SAFETY: `SLSMainConnectionID` returns the process' SkyLight connection;
+    // `window_id` is a plain CG window id. The returned string, if any, is owned.
+    let uuid = unsafe { SLSCopyManagedDisplayForWindow(SLSMainConnectionID(), window_id) };
+    if !uuid.is_null() {
+        return Some(OwnedCf(uuid));
+    }
+
+    let mut frame = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize {
+            width: 0.0,
+            height: 0.0,
+        },
+    };
+    // SAFETY: `frame` is a valid out pointer; on success SkyLight writes the
+    // window's bounds so we can ask for the best managed display for that rect.
+    let err = unsafe { SLSGetWindowBounds(SLSMainConnectionID(), window_id, &mut frame) };
+    if err != 0 {
+        return None;
+    }
+
+    // SAFETY: `frame` was initialized above and is passed by value; the returned
+    // display string, if non-null, is owned by the caller.
+    let uuid = unsafe { SLSCopyBestManagedDisplayForRect(SLSMainConnectionID(), frame) };
+    (!uuid.is_null()).then_some(OwnedCf(uuid))
+}
+
+fn current_space_for_window_display(window_id: u32) -> Option<u64> {
+    let uuid = window_display_uuid(window_id)?;
+    // SAFETY: `uuid` is a valid CFString display identifier for the duration of
+    // the call.
+    let sid = unsafe { SLSManagedDisplayGetCurrentSpace(SLSMainConnectionID(), uuid.as_ptr()) };
+    (sid != 0).then_some(sid)
 }
 
 /// Return Mission Control's current space id for `display_id`.
@@ -202,6 +306,52 @@ pub fn spaces_for_display(display_id: u32) -> io::Result<Vec<u64>> {
     }
 
     Ok(result)
+}
+
+/// Return the Mission Control space ids containing `window_id`.
+pub fn spaces_for_window(window_id: u32) -> io::Result<Vec<u64>> {
+    let window_number = owned_cfnumber_i32(window_id as i32)?;
+    let window_list = owned_single_value_array(&window_number)?;
+
+    // SAFETY: `window_list` is a valid CFArray containing one CFNumber window id.
+    // Selector `0x7` matches yabai's C `window_space_list` query.
+    let space_list = unsafe {
+        SLSCopySpacesForWindows(
+            SLSMainConnectionID(),
+            0x7,
+            window_list.as_ptr() as CFArrayRef,
+        )
+    };
+    let mut result = Vec::new();
+    if !space_list.is_null() {
+        let space_list = OwnedCf(space_list);
+        // SAFETY: `space_list` is a valid CFArray of borrowed CFNumber values;
+        // every entry is null-checked by `cfnumber_u64`.
+        unsafe {
+            let count = CFArrayGetCount(space_list.as_ptr() as CFArrayRef);
+            for index in 0..count {
+                let sid_ref =
+                    CFArrayGetValueAtIndex(space_list.as_ptr() as CFArrayRef, index) as CFNumberRef;
+                if let Some(sid) = cfnumber_u64(sid_ref) {
+                    result.push(sid);
+                }
+            }
+        }
+    }
+
+    if result.is_empty() {
+        if let Some(sid) = current_space_for_window_display(window_id) {
+            result.push(sid);
+        }
+    }
+
+    if result.is_empty() {
+        Err(io::Error::other(format!(
+            "failed to discover spaces for window {window_id}"
+        )))
+    } else {
+        Ok(result)
+    }
 }
 
 #[cfg(test)]

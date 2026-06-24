@@ -38,6 +38,8 @@ pub enum StateEvent {
     DisplayRemoved { display_id: u32 },
     /// A new managed window appeared on the active space.
     WindowCreated { window_id: u32 },
+    /// A managed window belongs to a specific space (new or moved).
+    WindowAssignedToSpace { window_id: u32, sid: u64 },
     /// A managed window went away.
     WindowDestroyed { window_id: u32 },
     /// Focus moved to a window.
@@ -141,6 +143,10 @@ impl AppState {
         self.active_space = Some(sid);
     }
 
+    pub fn active_space_id(&self) -> Option<u64> {
+        self.active_space
+    }
+
     pub fn set_focused_window(&mut self, window_id: Option<u32>) {
         self.focused_window = window_id;
     }
@@ -170,15 +176,46 @@ impl AppState {
 
     /// Add a window to the active space (respecting the current focus).
     pub fn add_window(&mut self, window_id: u32) -> Result<(), String> {
-        let focused = self.focused_window;
-        self.active_tree_mut()?.add_window(window_id, focused);
-        self.focused_window = Some(window_id);
+        let sid = self
+            .active_space
+            .ok_or_else(|| "no active space".to_string())?;
+        self.assign_window_to_space(window_id, sid)
+    }
+
+    /// Assign a window to `sid`, removing it from any previous tree first.
+    pub fn assign_window_to_space(&mut self, window_id: u32, sid: u64) -> Result<(), String> {
+        let previous_sid = self.window_space(window_id);
+        if previous_sid == Some(sid) {
+            return Ok(());
+        }
+        if !self.spaces.contains_key(&sid) {
+            return Err("space has no layout".to_string());
+        }
+
+        for tree in self.spaces.values_mut() {
+            tree.remove_window(window_id);
+        }
+
+        let focused = self.focused_window.filter(|&focused| {
+            self.spaces
+                .get(&sid)
+                .is_some_and(|tree| tree.find_window_node(focused).is_some())
+        });
+        self.spaces
+            .get_mut(&sid)
+            .expect("space existence checked above")
+            .add_window(window_id, focused);
+        if previous_sid.is_none() {
+            self.focused_window = Some(window_id);
+        }
         Ok(())
     }
 
-    /// Remove a window from the active space.
+    /// Remove a window from whichever space currently owns it.
     pub fn remove_window(&mut self, window_id: u32) -> Result<(), String> {
-        self.active_tree_mut()?.remove_window(window_id);
+        for tree in self.spaces.values_mut() {
+            tree.remove_window(window_id);
+        }
         if self.focused_window == Some(window_id) {
             self.focused_window = None;
         }
@@ -250,6 +287,11 @@ impl AppState {
             StateEvent::WindowCreated { window_id } => {
                 if self.config.manage {
                     self.add_window(window_id)?;
+                }
+            }
+            StateEvent::WindowAssignedToSpace { window_id, sid } => {
+                if self.config.manage {
+                    self.assign_window_to_space(window_id, sid)?;
                 }
             }
             StateEvent::WindowDestroyed { window_id } => {
@@ -1089,6 +1131,52 @@ mod tests {
             .handle_event(StateEvent::WindowDestroyed { window_id: 2 })
             .unwrap();
         assert_eq!(state.space(1).unwrap().window_list(), vec![1]);
+    }
+
+    #[test]
+    fn window_assignment_targets_specific_space() {
+        let mut state = state_with_displays();
+        state.set_active_space(1);
+        state
+            .handle_event(StateEvent::WindowAssignedToSpace {
+                window_id: 20,
+                sid: 2,
+            })
+            .unwrap();
+
+        assert!(state.space(1).unwrap().window_list().is_empty());
+        assert_eq!(state.space(2).unwrap().window_list(), vec![20]);
+        assert!(state.flush_active().unwrap().is_empty());
+    }
+
+    #[test]
+    fn window_assignment_moves_between_spaces_without_refocusing() {
+        let mut state = state_with_displays();
+        state.set_active_space(1);
+        state
+            .handle_event(StateEvent::WindowAssignedToSpace {
+                window_id: 10,
+                sid: 1,
+            })
+            .unwrap();
+        state
+            .handle_event(StateEvent::WindowAssignedToSpace {
+                window_id: 20,
+                sid: 1,
+            })
+            .unwrap();
+        state.set_focused_window(Some(10));
+
+        state
+            .handle_event(StateEvent::WindowAssignedToSpace {
+                window_id: 20,
+                sid: 2,
+            })
+            .unwrap();
+
+        assert_eq!(state.space(1).unwrap().window_list(), vec![10]);
+        assert_eq!(state.space(2).unwrap().window_list(), vec![20]);
+        assert_eq!(state.focused_window, Some(10));
     }
 
     #[test]

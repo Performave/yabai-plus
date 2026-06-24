@@ -13,8 +13,8 @@ use yabai_macos::{
     AxSink, ObservedEvent, accessibility_trusted_with_prompt, active_displays,
     application_pids_with_windows, current_space_for_display, focused_window,
     focused_window_diagnostics, main_visible_frame, move_focused_window, move_pid_window,
-    observe_pid, regular_application_pids, spaces_for_display, tileable_pid_windows,
-    windows_for_pid, windows_for_pid_diagnostics,
+    observe_pid, regular_application_pids, spaces_for_display, spaces_for_window,
+    tileable_pid_windows, windows_for_pid, windows_for_pid_diagnostics,
 };
 use yabai_runtime::{
     Actor, AppState, LayoutSink, RecordingSink, Response, Runtime, StateEvent, WindowMeta,
@@ -566,10 +566,21 @@ fn spawn_observer(pid: i32, tx: &Sender<WmWork>) {
     });
 }
 
+fn managed_space_for_window(state: &AppState, window_id: u32) -> Option<u64> {
+    let spaces = spaces_for_window(window_id).ok()?;
+    if let Some(active_sid) = state.active_space_id() {
+        if spaces.contains(&active_sid) {
+            return Some(active_sid);
+        }
+    }
+    spaces.into_iter().find(|sid| state.space(*sid).is_some())
+}
+
 /// Reconcile the managed window set for one app against what AX currently
 /// reports, registering newcomers in the sink and dropping windows that vanished
 /// (which robustly handles closes despite unreliable AX destroy notifications),
-/// then re-flow the active layout.
+/// then re-flow the active layout. Windows outside the seeded first-display
+/// spaces are ignored, which also drops windows moved to untracked displays.
 fn reconcile_pid(
     runtime: &mut Runtime<AxSink>,
     managed: &mut HashMap<i32, HashSet<u32>>,
@@ -583,6 +594,9 @@ fn reconcile_pid(
 
     for window in discovered {
         let id = window.id;
+        let Some(sid) = managed_space_for_window(&runtime.state, id) else {
+            continue;
+        };
         current.insert(id);
         // Refresh metadata every pass so titles stay current.
         runtime.state.set_window_meta(
@@ -596,10 +610,10 @@ fn reconcile_pid(
         if !known.contains(&id) {
             // A genuinely new window: hand its element to the sink and tree.
             runtime.sink.register(id, window.window);
-            let _ = runtime
-                .state
-                .handle_event(StateEvent::WindowCreated { window_id: id });
         }
+        let _ = runtime
+            .state
+            .handle_event(StateEvent::WindowAssignedToSpace { window_id: id, sid });
         // Else it is already managed; the freshly discovered duplicate element
         // drops here, leaving the existing registration intact.
     }

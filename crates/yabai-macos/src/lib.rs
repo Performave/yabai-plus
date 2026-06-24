@@ -33,7 +33,7 @@ pub use observe::{ObservedEvent, observe_pid};
 #[cfg(target_os = "macos")]
 pub use screen::main_visible_frame;
 #[cfg(target_os = "macos")]
-pub use space::{current_space_for_display, spaces_for_display};
+pub use space::{current_space_for_display, spaces_for_display, spaces_for_window};
 #[cfg(target_os = "macos")]
 pub use workspace::regular_application_pids;
 
