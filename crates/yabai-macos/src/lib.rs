@@ -7,6 +7,8 @@ pub mod display;
 #[cfg(target_os = "macos")]
 pub mod objc;
 #[cfg(target_os = "macos")]
+pub mod observe;
+#[cfg(target_os = "macos")]
 pub mod screen;
 #[cfg(target_os = "macos")]
 pub mod workspace;
@@ -20,6 +22,8 @@ pub use ax::{
 };
 #[cfg(target_os = "macos")]
 pub use display::{MacDisplay, active_displays};
+#[cfg(target_os = "macos")]
+pub use observe::{ObservedEvent, observe_pid};
 #[cfg(target_os = "macos")]
 pub use screen::main_visible_frame;
 #[cfg(target_os = "macos")]

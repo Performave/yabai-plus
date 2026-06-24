@@ -8,7 +8,8 @@ use yabai_macos::ax::DiscoveredAxWindow;
 use yabai_macos::{
     AxSink, accessibility_trusted_with_prompt, active_displays, focused_window,
     focused_window_diagnostics, main_visible_frame, move_focused_window, move_pid_window,
-    regular_application_pids, tileable_pid_windows, windows_for_pid, windows_for_pid_diagnostics,
+    observe_pid, regular_application_pids, tileable_pid_windows, windows_for_pid,
+    windows_for_pid_diagnostics,
 };
 use yabai_runtime::{Actor, AppState, LayoutSink, RecordingSink, Runtime, StateEvent};
 
@@ -34,6 +35,7 @@ fn main() -> ExitCode {
         Some("--experimental-ax-move-pid") => run_ax_move_pid(&args[1..]),
         Some("--experimental-ax-tile-pid") => run_ax_tile_pid(&args[1..]),
         Some("--experimental-rust-tile-daemon") => run_rust_tile_daemon(&args[1..]),
+        Some("--experimental-ax-observe-pid") => run_ax_observe_pid(&args[1..]),
         _ => {
             eprintln!("yabai-rust: daemon skeleton is not implemented yet");
             ExitCode::from(64)
@@ -525,6 +527,36 @@ fn run_rust_tile_daemon(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Diagnostic: print AX window lifecycle events for an app as they happen.
+/// Proves the observer/run-loop callback path on a live app before the daemon
+/// consumes these events. Runs until interrupted (Ctrl-C).
+fn run_ax_observe_pid(args: &[String]) -> ExitCode {
+    if !accessibility_trusted_with_prompt() {
+        eprintln!("yabai-rust: Accessibility permission is not granted; grant it and rerun");
+        return ExitCode::from(1);
+    }
+    let Some(pid) = args.first().and_then(|arg| arg.parse::<i32>().ok()) else {
+        eprintln!("yabai-rust: --experimental-ax-observe-pid requires a pid");
+        return ExitCode::from(64);
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    // The run loop must own a thread; print events from the main thread.
+    let observer = std::thread::spawn(move || observe_pid(pid, tx));
+    eprintln!("yabai-rust: observing pid {pid} — open/close/focus its windows (Ctrl-C to stop)");
+    for event in rx {
+        println!("{event:?}");
+    }
+    // The channel only closes if the observer thread returned (setup failure).
+    match observer.join() {
+        Ok(Err(error)) => {
+            eprintln!("yabai-rust: observer stopped: {error}");
+            ExitCode::from(1)
+        }
+        _ => ExitCode::SUCCESS,
+    }
+}
+
 fn run_ax_debug_probe() -> ExitCode {
     if !accessibility_trusted_with_prompt() {
         eprintln!("yabai-rust: Accessibility permission is not granted; grant it and rerun");
@@ -570,6 +602,8 @@ fn print_help() {
                                      BSP-tile an app's windows via the Rust core.\n\
              --experimental-rust-tile-daemon <socket> <pid|all> [gap] [padding]\n\
                                      Persistent tiling daemon (serves -m commands).\n\
+             --experimental-ax-observe-pid <pid>\n\
+                                     Print live AX window lifecycle events.\n\
              --version, -v          Print Rust skeleton version to stdout and exit.\n\
              --help, -h             Print options to stdout and exit."
     );

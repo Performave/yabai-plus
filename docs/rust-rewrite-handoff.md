@@ -406,6 +406,25 @@ without macOS or a daemon.
   **8** windows across Finder + RustRover into a single BSP layout with 10px
   gaps/padding inside the visible frame (no menu-bar/Dock overlap), confirmed via
   screenshot; `query --windows id` over the socket reported 8. Clean shutdown.
+- Consolidated the duplicated objc FFI (`screen.rs`, `workspace.rs`) into a
+  shared `objc.rs`: `class`/`sel` plus generic `msg0::<R>` / `msg1::<A,R>` that
+  reinterpret `objc_msgSend` with the concrete method ABI (correct on arm64 for
+  by-value struct returns like `NSRect`, no `_stret` needed).
+- **AX observers** (item 1 below — started, the callback half). New `observe.rs`
+  wraps `AXObserver` (create + add-notification + run-loop source) and turns each
+  callback into a typed `ObservedEvent` (`WindowCreated`/`WindowDestroyed`/
+  `FocusedWindowChanged`, each carrying pid + optional CG id). `observe_pid(pid,
+  tx)` registers app-level created/focus + per-window destroyed, then blocks in
+  `CFRunLoopRun`, sending events over an mpsc channel. A C `refcon` carries a
+  shared `ObserverCtx` so the callback can register a destroy-watch on each newly
+  created window. Diagnostic CLI `--experimental-ax-observe-pid <pid>`.
+- Live verification (Finder): opening windows produced `WindowCreated` +
+  `FocusedWindowChanged` reliably with resolved CG ids (e.g. 4253, 4254);
+  focusing produced `FocusedWindowChanged`. IMPORTANT FINDING:
+  `AXUIElementDestroyed` registered cleanly (rc=0) but macOS never delivered it on
+  a Finder window close — pure-AX destroys are unreliable (yabai uses private
+  SkyLight events for these). Documented in `observe.rs`; the daemon integration
+  must reconcile the live `AXWindows` set on each event to catch closes.
 - Whole workspace is still 105 passing tests; `cargo fmt --all`, `cargo test
   --workspace`, and `cargo clippy --workspace --all-targets` are clean.
 
