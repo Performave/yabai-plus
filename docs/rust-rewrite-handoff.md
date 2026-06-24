@@ -445,12 +445,23 @@ without macOS or a daemon.
 - Whole workspace is still 105 passing tests; `cargo fmt --all`, `cargo test
   --workspace`, and `cargo clippy --workspace --all-targets` are clean.
 
-Next (rest of Phase 5): (1) harden the WM daemon — observe app launch/terminate
-(`NSWorkspace` notifications) so apps started after the daemon are managed, and
-add SkyLight space/display change handling; consider periodic reconcile as a
-backstop. (2) Expand the Rust query serializer as live app/title/display/space
-metadata becomes available. (3) Multi-display: the daemon currently tiles only
-the first display's visible frame into one space.
+- Added a periodic self-heal `Tick` (every 3s) to the WM daemon: it
+  re-reconciles every observed app, a backstop for any window change an observer
+  missed (notably the unreliable AX destroy). Factored observer spawning into
+  `spawn_observer`. IMPORTANT FINDING: discovering apps *launched after startup*
+  via `NSWorkspace.runningApplications` does **not** work from this event loop —
+  the list is frozen at process-launch because it only refreshes with a pumped
+  main `CFRunLoop`, which the channel-blocked event loop deliberately lacks.
+  Verified live: launching Calculator under `all` never appeared (stayed 10 apps
+  across 3 ticks). The fix is a `CGWindowListCopyWindowInfo`-based pid scan (it
+  refreshes without a run loop) — documented in the `Tick` handler and deferred.
+- Whole workspace is still 105 passing tests; `cargo fmt`/`test`/`clippy` clean.
+
+Next (rest of Phase 5): (1) `CGWindowList`-based app/window discovery so the WM
+daemon picks up apps launched after startup (replaces the run-loop-dependent
+`NSWorkspace` snapshot for the live path). (2) Expand the Rust query serializer
+as live app/title/display/space metadata becomes available. (3) Multi-display:
+the daemon currently tiles only the first display's visible frame into one space.
 
 ### 2026-06-23 (session 2)
 

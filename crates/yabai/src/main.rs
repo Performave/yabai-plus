@@ -4,6 +4,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::ExitCode;
 use std::sync::mpsc::{Sender, SyncSender, channel, sync_channel};
 use std::thread;
+use std::time::Duration;
 
 use yabai_core::Area;
 use yabai_ipc::{FAILURE_MARKER, daemon_socket_path, decode_client_payload, send_message};
@@ -536,10 +537,30 @@ fn run_rust_tile_daemon(args: &[String]) -> ExitCode {
 /// messages funnel into one channel processed against one `Runtime<AxSink>`.
 enum WmWork {
     Observed(ObservedEvent),
+    /// Periodic self-heal: re-reconcile known apps and (in `all` mode) discover
+    /// apps launched after startup.
+    Tick,
     Message {
         tokens: Vec<String>,
         reply: SyncSender<Response>,
     },
+}
+
+/// Spawn an AX observer for `pid` on its own run-loop thread, forwarding its
+/// events into the shared `WmWork` channel.
+fn spawn_observer(pid: i32, tx: &Sender<WmWork>) {
+    let (otx, orx) = channel::<ObservedEvent>();
+    thread::spawn(move || {
+        let _ = observe_pid(pid, otx);
+    });
+    let tx = tx.clone();
+    thread::spawn(move || {
+        for event in orx {
+            if tx.send(WmWork::Observed(event)).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 /// Reconcile the managed window set for one app against what AX currently
@@ -701,20 +722,24 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
     }
     let initial: usize = managed.values().map(HashSet::len).sum();
 
-    // Unified event loop: observers + socket feed one channel.
+    // Unified event loop: observers, the periodic tick, and the socket all feed
+    // one channel processed against the single `Runtime<AxSink>`.
     let (tx, rx) = channel::<WmWork>();
 
-    // One AX observer per app on its own run-loop thread, forwarding into `tx`.
+    // One AX observer per app on its own run-loop thread.
+    let mut observed: HashSet<i32> = HashSet::new();
     for pid in &pids {
-        let (otx, orx) = channel::<ObservedEvent>();
-        let pid = *pid;
-        thread::spawn(move || {
-            let _ = observe_pid(pid, otx);
-        });
+        observed.insert(*pid);
+        spawn_observer(*pid, &tx);
+    }
+
+    // Periodic self-heal tick (also picks up newly launched apps in `all` mode).
+    {
         let tx = tx.clone();
         thread::spawn(move || {
-            for event in orx {
-                if tx.send(WmWork::Observed(event)).is_err() {
+            loop {
+                thread::sleep(Duration::from_secs(3));
+                if tx.send(WmWork::Tick).is_err() {
                     break;
                 }
             }
@@ -733,8 +758,8 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
             }
         });
     }
-    drop(tx);
 
+    // The main thread keeps `tx` alive, so the loop runs until the process dies.
     eprintln!(
         "yabai-rust: WM daemon up on {socket_path} — target {target}, {} app(s), {initial} window(s), gap {gap}, padding {padding}",
         pids.len()
@@ -746,6 +771,17 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
     for work in rx {
         match work {
             WmWork::Observed(event) => reconcile_pid(&mut runtime, &mut managed, event.pid()),
+            WmWork::Tick => {
+                // Self-heal: re-reconcile every known app, catching any window
+                // change an observer missed (e.g. the unreliable AX destroy).
+                // NOTE: apps *launched* after startup are not discovered here —
+                // `NSWorkspace.runningApplications` does not refresh without a
+                // pumped main run loop, which this event loop deliberately lacks.
+                // Picking up new apps needs a `CGWindowList`-based scan (future).
+                for pid in observed.iter().copied().collect::<Vec<_>>() {
+                    reconcile_pid(&mut runtime, &mut managed, pid);
+                }
+            }
             WmWork::Message { tokens, reply } => {
                 let response = runtime.message(&tokens);
                 let _ = reply.send(response);
