@@ -52,6 +52,8 @@ pub enum StateEvent {
         display_id: u32,
         frame: Area,
     },
+    /// A space disappeared.
+    SpaceRemoved { sid: u64 },
     /// The active space changed.
     SpaceChanged { sid: u64 },
     /// A space's display frame changed (display add/resize/move); re-inset and
@@ -137,6 +139,25 @@ impl AppState {
     pub fn add_space_to_display(&mut self, sid: u64, display_id: u32, area: Area) {
         self.add_space(sid, area);
         self.space_displays.insert(sid, display_id);
+    }
+
+    pub fn remove_space(&mut self, sid: u64) {
+        if let Some(tree) = self.spaces.remove(&sid) {
+            for window_id in tree.window_list() {
+                self.window_meta.remove(&window_id);
+                if self.focused_window == Some(window_id) {
+                    self.focused_window = None;
+                }
+            }
+        }
+        self.space_displays.remove(&sid);
+        if self.active_space == Some(sid) {
+            self.active_space = self.spaces.keys().copied().min();
+        }
+    }
+
+    pub fn space_ids_for_display(&self, display_id: u32) -> Vec<u64> {
+        self.display_spaces(display_id)
     }
 
     pub fn set_active_space(&mut self, sid: u64) {
@@ -309,6 +330,7 @@ impl AppState {
                 display_id,
                 frame,
             } => self.add_space_to_display(sid, display_id, frame),
+            StateEvent::SpaceRemoved { sid } => self.remove_space(sid),
             StateEvent::SpaceChanged { sid } => self.active_space = Some(sid),
             StateEvent::DisplayFrameChanged { sid, frame } => self.set_space_frame(sid, frame)?,
         }
@@ -1177,6 +1199,27 @@ mod tests {
         assert_eq!(state.space(1).unwrap().window_list(), vec![10]);
         assert_eq!(state.space(2).unwrap().window_list(), vec![20]);
         assert_eq!(state.focused_window, Some(10));
+    }
+
+    #[test]
+    fn space_removed_drops_tree_and_active_space() {
+        let mut state = state_with_displays();
+        state.set_active_space(2);
+        state
+            .handle_event(StateEvent::WindowAssignedToSpace {
+                window_id: 20,
+                sid: 2,
+            })
+            .unwrap();
+
+        state
+            .handle_event(StateEvent::SpaceRemoved { sid: 2 })
+            .unwrap();
+
+        assert!(state.space(2).is_none());
+        assert_eq!(state.space_ids_for_display(77), Vec::<u64>::new());
+        assert_eq!(state.active_space_id(), Some(1));
+        assert_eq!(state.focused_window, None);
     }
 
     #[test]

@@ -576,6 +576,35 @@ fn managed_space_for_window(state: &AppState, window_id: u32) -> Option<u64> {
     spaces.into_iter().find(|sid| state.space(*sid).is_some())
 }
 
+fn refresh_display_spaces(runtime: &mut Runtime<AxSink>, display_id: u32, usable: Area) {
+    let Ok(sids) = spaces_for_display(display_id) else {
+        return;
+    };
+    if sids.is_empty() {
+        return;
+    }
+
+    let current = sids.iter().copied().collect::<HashSet<_>>();
+    for sid in &sids {
+        if runtime.state.space(*sid).is_none() {
+            let _ = runtime
+                .state
+                .handle_event(StateEvent::SpaceCreatedOnDisplay {
+                    sid: *sid,
+                    display_id,
+                    frame: usable,
+                });
+            let _ = runtime.state.set_space_frame(*sid, usable);
+        }
+    }
+
+    for sid in runtime.state.space_ids_for_display(display_id) {
+        if !current.contains(&sid) {
+            let _ = runtime.state.handle_event(StateEvent::SpaceRemoved { sid });
+        }
+    }
+}
+
 fn refresh_active_space(runtime: &mut Runtime<AxSink>, display_id: u32) {
     let Ok(sid) = current_space_for_display(display_id) else {
         return;
@@ -835,10 +864,12 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
     for work in rx {
         match work {
             WmWork::Observed(event) => {
+                refresh_display_spaces(&mut runtime, display.id, usable);
                 refresh_active_space(&mut runtime, display.id);
                 reconcile_pid(&mut runtime, &mut managed, event.pid());
             }
             WmWork::Tick => {
+                refresh_display_spaces(&mut runtime, display.id, usable);
                 refresh_active_space(&mut runtime, display.id);
                 // In `all` mode, pick up apps launched after startup via the live
                 // CGWindowList scan, and start observing each.
@@ -856,6 +887,7 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                 }
             }
             WmWork::Message { tokens, reply } => {
+                refresh_display_spaces(&mut runtime, display.id, usable);
                 refresh_active_space(&mut runtime, display.id);
                 let response = runtime.message(&tokens);
                 let _ = reply.send(response);
