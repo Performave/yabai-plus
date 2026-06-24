@@ -835,7 +835,7 @@ chronological log and may describe earlier states.
     `Message`. `ParseError` `Display` text matches the C `daemon_fail` strings.
 - `crates/yabai-ipc` (6 tests) — client wire framing + `send_message`; the
   `crates/yabai` binary `-m` path uses it and talks to the live C daemon.
-- `crates/yabai-runtime` (22 tests) — the control plane, depends on `yabai-core`:
+- `crates/yabai-runtime` (27 tests) — the control plane, depends on `yabai-core`:
   - `config.rs`: `Config` (all settable keys) + get/set + `layout_config()`.
   - `app_state.rs`: `AppState` (config, `sid -> Tree`, active space, focused
     window). `handle_tokens`/`dispatch` apply messages; `handle_event` applies a
@@ -846,7 +846,9 @@ chronological log and may describe earlier states.
     mutation.
   - `actor.rs`: `Actor<S>` = a thread owning a `Runtime`, fed serialized work
     (`post_event`, blocking `message`, `shutdown` returns the `Runtime`).
-- `crates/yabai-macos` (4 tests) — Phase 5 boundary, depends on runtime+core:
+- `crates/yabai-macos` (4 tests) — Phase 5 boundary, depends on runtime+core.
+  Modules: `ax.rs`, `screen.rs`, `objc.rs`, `workspace.rs`, `cgwindow.rs`,
+  `observe.rs`, `display.rs`:
   - `ax.rs`: `AxSink` impl of `LayoutSink` moving windows via AX
     (`kAXPosition`/`kAXSize`); `AxWindow` RAII over `AXUIElementRef`; local
     CF/ApplicationServices FFI. Builds/links on macOS. Also AX diagnostics
@@ -856,42 +858,72 @@ chronological log and may describe earlier states.
     through `Runtime -> AppState -> AxSink` (verified live tiling 3 Finder
     windows). Plus `set_window_frame` / `read_window_frame` helpers.
   - `screen.rs`: `main_visible_frame()` (`NSScreen.visibleFrame`, menu bar +
-    Dock excluded, flipped to top-left CG coords) via local objc FFI.
-  - `workspace.rs`: `regular_application_pids()` (`NSWorkspace`) for multi-app
-    discovery. A persistent `--experimental-rust-tile-daemon <socket> <pid|all>`
-    in `crates/yabai` wires `Actor<AxSink>` + the socket loop into a live tiling
-    WM that serves `-m` commands (verified: rotate/balance move real windows).
+    Dock excluded, flipped to top-left CG coords) via shared objc FFI.
+  - `objc.rs`: shared Objective-C glue (`class`/`sel`, generic `msg0`/`msg1`).
+  - `workspace.rs`: `regular_application_pids()` (`NSWorkspace`; NOTE: does not
+    refresh without a pumped run loop — see below).
+  - `cgwindow.rs`: `on_screen_windows()` / `application_pids_with_windows()`
+    (`CGWindowListCopyWindowInfo`) — live app/window discovery that DOES refresh
+    without a run loop; no Screen Recording perm (reads pid/number/layer only).
+  - `observe.rs`: `observe_pid(pid, tx)` wraps `AXObserver` → typed
+    `ObservedEvent`s over a channel (`WindowCreated`/`Destroyed`/
+    `FocusedWindowChanged`). NOTE: `AXUIElementDestroyed` is unreliable; use set
+    reconciliation, not the notification.
 - `crates/yabai-osax-common`, `-osax-legacy`, `-sa` — still scaffolding/constants.
 
-End-to-end today: `Actor -> Runtime -> AppState (Config + Tree) -> LayoutSink`
-turns `-m` tokens or a `StateEvent` into `WindowFrame`s, and `AxSink` applies
-them to real windows. No Rust daemon process exists yet.
+THE LIVE WM DAEMON (in `crates/yabai/src/main.rs`):
+`--experimental-rust-wm-daemon <socket> <pid|all> [gap] [padding]` is a working
+dynamic tiling WM. A single-threaded event loop on the main thread owns
+`Runtime<AxSink>` (so all sink registration stays single-threaded) and consumes a
+unified `WmWork` channel fed by (a) one `observe_pid` thread per app, (b) a 3s
+self-heal `Tick`, (c) a socket-acceptor thread. `reconcile_pid` re-discovers an
+app's tileable windows on each event, registers newcomers / drops vanished ones
+(robust to the unreliable AX destroy), sets `app`/`title`/`pid` metadata, and
+re-flows. Verified live: auto-tile on open, auto-reconcile on close, new-app
+pickup via CGWindowList, `space --rotate/--balance` over the socket, and
+`query --windows id,app,title` returning real values.
 
-### Do these next, in order
+Other experimental flags in `main.rs`: `--experimental-ax-{focused-window,debug,
+windows-for-pid,pid-debug,move-focused,move-pid,tile-pid,observe-pid}`,
+`--experimental-rust-{daemon,tile-daemon}` (the tile-daemon is the older
+snapshot-only `Actor<AxSink>` version; the wm-daemon supersedes it).
 
-1. AX/SkyLight callback -> `StateEvent` translation (rest of Phase 5, highest
-   risk, macOS-version sensitive): app/window observers for create/destroy/
-   focus/title, space/display changes. Each new window must get its
-   `AXUIElementRef` discovered and `AxSink::register`ed. Build behind small,
-   documented `unsafe`, isolated like `ax.rs`.
-2. A Rust daemon entry that owns an `Actor<AxSink>` + observers + a socket
-   server feeding `Actor::message`. CRITICAL: do NOT bind
-   `/tmp/yabai_$USER.socket` while the C daemon runs — use a distinct path
-   behind a flag, or it will fight the live daemon.
-3. JSON golden tests + a Rust query serializer to lock the read path (`query
-   --displays/--spaces/--windows`) against captured live-daemon output.
+End-to-end today: a real dynamic tiling WM for the first display / one space,
+driven entirely by the pure core. Single-display, single-space only.
+
+### Do these next, in order (Phase 5/6 breadth — the big remaining work)
+
+1. Multi-space + Mission Control: discover spaces (SkyLight), per-space trees,
+   `--space` focus/move, space create/destroy. Highest-value next step.
+2. Multi-display: the WM daemon tiles only `active_displays().next()` today; add
+   per-display spaces and route windows to the display they're on.
+3. App-termination handling (drop a whole app's windows promptly; the 3s tick is
+   only a backstop) and observing app launch directly (vs CGWindowList polling).
+4. More window ops needing live state: focus (raise/without-raise), minimize/
+   fullscreen/sticky/scratchpad, opacity/layer; mouse drag move/resize/swap;
+   rules + signals execution.
+5. Then Phases 7-9: scripting addition (`yabai-sa`, currently empty — required
+   for space management / cross-space moves on modern macOS), OSAX spike, and
+   production packaging (wire the Rust binary into `make`, signing, notarization,
+   launchd, cutover). None started.
 
 ### Hard rules / gotchas (do not violate)
 
 - Do NOT point Homebrew, launchd, `make dev`, or `/usr/local/bin/yabai` at
-  `target/debug/yabai`. It is a client only; there is no Rust daemon.
-- The user runs yabai live. Read-only `query` via the Rust client is safe;
-  never bind the live socket from Rust.
+  `target/debug/yabai`. The Rust binary is a client + experimental daemons only;
+  it is not wired into `make`/signing/launchd and must not replace the C daemon.
+- The user runs the C yabai live. Read-only `query` via the Rust client is safe;
+  never bind `/tmp/yabai_$USER.socket` from Rust. The WM-daemon live tests run
+  with the C service stopped so nothing fights the tiling.
 - Workspace lints deny `clippy::undocumented_unsafe_blocks` — every `unsafe`
   block needs a `// SAFETY:` comment. `cargo fmt` reorders `use` lists
   (types/fns interleaved alphabetically); let it, then match its output.
 - Verify each step with `cargo fmt --all && cargo clippy --workspace
-  --all-targets && cargo test --workspace`. Currently 97 tests, clippy clean.
+  --all-targets && cargo test --workspace`. Currently 106 tests, clippy clean.
+- The live WM daemon binds only a caller-supplied socket; to message it use a
+  socket named `/tmp/yabai_<name>.socket` and query with `USER=<name>`. Always
+  `pkill -f experimental-rust-wm-daemon` to stop it (each shell call is a fresh
+  process — a `$DPID` from a previous Bash call is gone).
 - Do not edit generated `src/osax/*_bin.c`; do not sign injected OSAX with
   hardened runtime; defer the OSAX payload rewrite (Phase 8).
 - Treat the C code as the reference implementation, not an upstream constraint;
