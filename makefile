@@ -108,9 +108,12 @@ release: install # optimized -O3 build -> bin/yabai (upstream: `install`, instal
 # trust carry over), swap into the Homebrew path in place, and restart the service.
 # The scripting addition lives in Dock and survives yabai restarts, so no --load-sa
 # is needed here unless Dock itself has restarted.
-# DEV_DEST is normally a Homebrew symlink into the read-only Cellar, so we replace
-# the symlink with our build rather than writing through it. The /opt/homebrew/bin
-# dir is user-writable, and a fresh file avoids "can't overwrite a running binary".
+# DEV_DEST is a Homebrew symlink into the (user-writable) Cellar. We keep the symlink
+# and overwrite the file it points at IN PLACE, rather than replacing the symlink with
+# a literal file. macOS ties a CLI tool's Accessibility grant to the *resolved* binary
+# path, so reusing the exact path production runs from avoids re-granting Accessibility
+# on every dev swap. rm-then-cp gives a fresh inode at the same path, which both dodges
+# "can't overwrite a running binary" (ETXTBSY) and leaves the path unchanged.
 # Re-invoke make with VERSION set so the canary string is baked in at parse time
 # (the -DYABAI_VERSION conditional at the top is evaluated when the makefile is
 # read, not per-recipe, so a target-specific override wouldn't reach it).
@@ -118,8 +121,10 @@ dev:
 	$(MAKE) all VERSION="$(DEV_VERSION)"
 	codesign --force --options runtime --sign "$(DEV_IDENTITY)" $(BUILD_PATH)/yabai
 	codesign --verify --strict $(BUILD_PATH)/yabai
-	rm -f $(DEV_DEST)
-	cp $(BUILD_PATH)/yabai $(DEV_DEST)
+	@target="$$(readlink -f $(DEV_DEST) 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' $(DEV_DEST))"; \
+	if [ "$$target" != "$(DEV_DEST)" ] && [ ! -e "$$target.brew-orig" ]; then cp "$$target" "$$target.brew-orig"; fi; \
+	rm -f "$$target"; \
+	cp $(BUILD_PATH)/yabai "$$target"
 	# Regenerate the sha256-pinned passwordless --load-sa rule for the new binary. Write to
 	# a temp file and validate it with `visudo -cf` before moving it into place, so a bad
 	# line can never lock sudo. With the rule in place, the service's own `sudo yabai
@@ -145,8 +150,17 @@ sa-status:
 		echo "scripting-addition: NOT loaded -- run 'sudo $(DEV_DEST) --load-sa'"; \
 	fi
 
-# Restore the Homebrew-managed release binary (recreates the Cellar symlink).
+# Restore the genuine Homebrew binary. `make dev` overwrites the Cellar file in place
+# and backs the original up as <file>.brew-orig; put that back (same rm-then-cp, so the
+# resolved path -- and thus the Accessibility grant -- is preserved). Fall back to
+# re-linking the formula if no backup is present (e.g. an older swap replaced the symlink).
 dev-restore:
-	brew unlink yabai-plus && brew link --overwrite yabai-plus
+	@target="$$(readlink -f $(DEV_DEST) 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' $(DEV_DEST))"; \
+	if [ -e "$$target.brew-orig" ]; then \
+		rm -f "$$target"; cp "$$target.brew-orig" "$$target"; rm -f "$$target.brew-orig"; \
+		echo "restored genuine brew binary at $$target"; \
+	else \
+		brew unlink yabai-plus && brew link --overwrite yabai-plus; \
+	fi
 	yabai --restart-service
 	@echo "restored $$($(DEV_DEST) --version) and restarted"
