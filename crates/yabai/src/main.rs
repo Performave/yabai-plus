@@ -9,7 +9,7 @@ use yabai_macos::{
     focused_window_diagnostics, main_visible_frame, move_focused_window, move_pid_window,
     tileable_pid_windows, windows_for_pid, windows_for_pid_diagnostics,
 };
-use yabai_runtime::{Actor, AppState, RecordingSink, Runtime, StateEvent};
+use yabai_runtime::{Actor, AppState, LayoutSink, RecordingSink, Runtime, StateEvent};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         Some("--experimental-ax-move-focused") => run_ax_move_focused(&args[1..]),
         Some("--experimental-ax-move-pid") => run_ax_move_pid(&args[1..]),
         Some("--experimental-ax-tile-pid") => run_ax_tile_pid(&args[1..]),
+        Some("--experimental-rust-tile-daemon") => run_rust_tile_daemon(&args[1..]),
         _ => {
             eprintln!("yabai-rust: daemon skeleton is not implemented yet");
             ExitCode::from(64)
@@ -114,7 +115,7 @@ fn bind_experimental_daemon(socket_path: &str) -> io::Result<UnixListener> {
     UnixListener::bind(socket_path)
 }
 
-fn serve_one(mut stream: UnixStream, actor: &Actor<RecordingSink>) {
+fn serve_one<S: LayoutSink + Send + 'static>(mut stream: UnixStream, actor: &Actor<S>) {
     let mut header = [0u8; size_of::<i32>()];
     let response = match stream.read_exact(&mut header) {
         Ok(()) => {
@@ -347,24 +348,7 @@ fn run_ax_tile_pid(args: &[String]) -> ExitCode {
     rt.state.set_active_space(1);
     // window_gap controls the between-window gap; the four paddings control the
     // outer margin. Set both, then inset the space's root area by the paddings.
-    let p = padding.to_string();
-    let config: Vec<String> = [
-        "config",
-        "window_gap",
-        &gap.to_string(),
-        "top_padding",
-        &p,
-        "bottom_padding",
-        &p,
-        "left_padding",
-        &p,
-        "right_padding",
-        &p,
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
-    let _ = rt.message(&config);
+    let _ = rt.message(&tile_config_tokens(gap, padding));
     if let Err(error) = rt.state.set_space_frame(1, usable) {
         eprintln!("yabai-rust: failed to apply padding: {error}");
         return ExitCode::from(1);
@@ -391,6 +375,135 @@ fn run_ax_tile_pid(args: &[String]) -> ExitCode {
             frame.window_id, frame.area.x, frame.area.y, frame.area.w, frame.area.h
         );
     }
+    ExitCode::SUCCESS
+}
+
+/// Tokens for a `config` message that sets the between-window gap and the four
+/// outer paddings, matching yabai's two-axis spacing model.
+fn tile_config_tokens(gap: i32, padding: i32) -> Vec<String> {
+    let g = gap.to_string();
+    let p = padding.to_string();
+    [
+        "config",
+        "window_gap",
+        &g,
+        "top_padding",
+        &p,
+        "bottom_padding",
+        &p,
+        "left_padding",
+        &p,
+        "right_padding",
+        &p,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// A persistent Rust tiling daemon: it tiles one app's windows through
+/// `Actor<AxSink>` and keeps serving the socket, so live `-m` commands
+/// (`space --rotate`, `--balance`, `window --resize`, ...) re-tile real windows.
+///
+/// CRITICAL: this binds the caller-provided socket path only; it must never bind
+/// `/tmp/yabai_$USER.socket` while a C daemon runs. To message it, use a socket
+/// named `/tmp/yabai_<name>.socket` and query with `USER=<name>`.
+fn run_rust_tile_daemon(args: &[String]) -> ExitCode {
+    let Some(socket_path) = args.first() else {
+        eprintln!(
+            "yabai-rust: --experimental-rust-tile-daemon requires <socket> <pid> [gap] [padding]"
+        );
+        return ExitCode::from(64);
+    };
+    let Some(pid) = args.get(1).and_then(|arg| arg.parse::<i32>().ok()) else {
+        eprintln!("yabai-rust: --experimental-rust-tile-daemon requires a pid");
+        return ExitCode::from(64);
+    };
+    let gap: i32 = args.get(2).and_then(|arg| arg.parse().ok()).unwrap_or(12);
+    let padding: i32 = args.get(3).and_then(|arg| arg.parse().ok()).unwrap_or(gap);
+
+    if !accessibility_trusted_with_prompt() {
+        eprintln!("yabai-rust: Accessibility permission is not granted; grant it and rerun");
+        return ExitCode::from(1);
+    }
+
+    // Bind the socket before touching any windows, so a bind failure (e.g. a
+    // stale socket or a conflicting daemon) aborts without rearranging anything.
+    let listener = match bind_experimental_daemon(socket_path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("yabai-rust: failed to bind daemon socket at {socket_path}: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let display = match active_displays() {
+        Ok(displays) => match displays.into_iter().next() {
+            Some(display) => display,
+            None => {
+                eprintln!("yabai-rust: no active displays found");
+                return ExitCode::from(1);
+            }
+        },
+        Err(error) => {
+            eprintln!("yabai-rust: failed to discover displays: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let usable = main_visible_frame().unwrap_or(display.frame);
+
+    let windows = match tileable_pid_windows(pid) {
+        Ok(windows) if !windows.is_empty() => windows,
+        Ok(_) => {
+            eprintln!("yabai-rust: pid {pid} has no tileable AX windows");
+            return ExitCode::from(1);
+        }
+        Err(error) => {
+            eprintln!("yabai-rust: failed to list AX windows for pid {pid}: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Register every window's AX element in the sink before it moves to the actor
+    // thread (the one allowed cross-thread move, per the single-actor invariant).
+    let mut sink = AxSink::new();
+    let mut ids = Vec::with_capacity(windows.len());
+    for window in windows {
+        ids.push(window.id);
+        sink.register(window.id, window.window);
+    }
+
+    let mut state = AppState::new();
+    state.add_display(display.id, display.frame);
+    state.add_space_to_display(1, display.id, usable);
+    state.set_active_space(1);
+    let _ = state.handle_tokens(&tile_config_tokens(gap, padding));
+    if let Err(error) = state.set_space_frame(1, usable) {
+        eprintln!("yabai-rust: failed to apply padding: {error}");
+        return ExitCode::from(1);
+    }
+
+    let actor = Actor::spawn(Runtime::new(state, sink));
+    // Drive the initial tile from the discovered windows.
+    for id in &ids {
+        actor.post_event(StateEvent::WindowCreated { window_id: *id });
+    }
+
+    eprintln!(
+        "yabai-rust: tiling daemon up on {socket_path} — pid {pid}, {} window(s), gap {gap}, padding {padding}",
+        ids.len()
+    );
+    eprintln!(
+        "yabai-rust: send commands with a matching USER, e.g. USER=<name> yabai -m space --rotate 90"
+    );
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => serve_one(stream, &actor),
+            Err(error) => eprintln!("yabai-rust: failed to accept client: {error}"),
+        }
+    }
+    actor.shutdown();
     ExitCode::SUCCESS
 }
 
@@ -437,6 +550,8 @@ fn print_help() {
                                      Move/resize an app's index-th AX window.\n\
              --experimental-ax-tile-pid <pid> [gap] [padding]\n\
                                      BSP-tile an app's windows via the Rust core.\n\
+             --experimental-rust-tile-daemon <socket> <pid> [gap] [padding]\n\
+                                     Persistent tiling daemon (serves -m commands).\n\
              --version, -v          Print Rust skeleton version to stdout and exit.\n\
              --help, -h             Print options to stdout and exit."
     );

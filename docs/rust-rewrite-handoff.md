@@ -374,17 +374,40 @@ without macOS or a daemon.
   with a 5px outer margin and 5px inter-window gaps — first window at
   `x=61 y=30` (56px Dock + 5, 25px menu bar + 5) and the right edge at 2555
   (2560 − 5). Confirmed visually via screenshot; no menu-bar/Dock overlap.
+- **Wired an `Actor<AxSink>` into a persistent Rust tiling daemon** (item 2 of
+  the next-steps list below — partially done). New
+  `--experimental-rust-tile-daemon <socket> <pid> [gap] [padding]`: it binds the
+  caller-provided socket *first* (never `/tmp/yabai_$USER.socket`), discovers the
+  display + visible frame + the app's tileable windows, registers each window's
+  AX element in an `AxSink`, seeds an `AppState` (display, space, gap/padding,
+  padding inset), spawns `Actor<AxSink>`, posts a `WindowCreated` per window to
+  drive the initial tile, then serves the socket forever. `serve_one` is now
+  generic over `Actor<S: LayoutSink>`, so the same socket loop backs both the
+  dry-run (`RecordingSink`) and live (`AxSink`) daemons. `tile_config_tokens`
+  is shared with `--experimental-ax-tile-pid`.
+- Live verification on this machine (yabai service stopped): started the daemon
+  on `/tmp/yabai_rustwm.socket` for Finder (pid 527); it tiled 5 windows and
+  `USER=rustwm yabai -m query --windows id,frame,has-focus` returned the live
+  tree state over the socket. Then `USER=rustwm yabai -m space --rotate 90`
+  visibly rotated the real windows (left-column + right-split → top/bottom),
+  `space --balance` re-balanced them, and `query --spaces id,windows,first-window`
+  reflected the reordered list. The daemon shut down cleanly and removed nothing
+  it shouldn't. This is the first persistent Rust daemon that serves live `-m`
+  commands which move real windows.
 - Whole workspace is still 105 passing tests; `cargo fmt --all`, `cargo test
   --workspace`, and `cargo clippy --workspace --all-targets` are clean.
 
 Next (rest of Phase 5): (1) the harder half — translate raw AX/SkyLight
 *callbacks* (app observers, window create/destroy/focus, space/display changes)
-into `StateEvent`s, including discovering each window's `AXUIElementRef` to
-`register` with the sink; (2) wire an `Actor<AxSink>` into a Rust daemon entry
-that owns the observers and a socket server (must NOT bind
-`/tmp/yabai_$USER.socket` while the C daemon runs — use a distinct path behind a
-flag); (3) expand the Rust query serializer as live app/title/display/space
-metadata becomes available.
+into `StateEvent`s, so the daemon tracks the world automatically instead of the
+current one-shot discovery snapshot; each new window must get its
+`AXUIElementRef` discovered and `register`ed with the sink. (2) Broaden the
+tiling daemon from a single pid to multi-app discovery (needs a running-apps
+enumeration, e.g. `NSWorkspace.runningApplications`) and feed observer events
+into `Actor::post_event`. (3) Expand the Rust query serializer as live
+app/title/display/space metadata becomes available. NOTE: the AX window set is
+volatile between snapshots, so the observer-driven model (1) is what makes the
+daemon robust against windows appearing/disappearing mid-run.
 
 ### 2026-06-23 (session 2)
 
