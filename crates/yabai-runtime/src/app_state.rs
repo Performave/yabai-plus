@@ -15,7 +15,8 @@ use std::collections::{HashMap, HashSet};
 
 use yabai_core::{
     Area, ConfigOp, Message, NodeSplit, QueryCommand, QueryScopeKind, QueryTarget, Selector,
-    SpaceAction, Tree, ViewType, WindowAction, WindowFrame, ZoomKind, parse_message,
+    Signal, SignalCommand, SignalEvent, SpaceAction, Tree, ViewType, WindowAction, WindowFrame,
+    ZoomKind, parse_message,
 };
 
 use crate::config::Config;
@@ -106,6 +107,9 @@ pub struct AppState {
     /// current space simultaneously, so the daemon flushes all of these, while
     /// `active_space` (the focused display's space) drives command dispatch.
     display_active_space: HashMap<u32, u64>,
+    /// Registered `signal`s in insertion order. The pure layer stores them and
+    /// resolves which fire for an event; the daemon runs the action commands.
+    signals: Vec<Signal>,
 }
 
 /// Lightweight per-window metadata the macOS layer supplies for queries
@@ -437,9 +441,10 @@ impl AppState {
             Message::Window(cmd) => self.dispatch_window(cmd.target.as_ref(), &cmd.actions),
             Message::Space(cmd) => self.dispatch_space(&cmd.actions),
             Message::Query(cmd) => self.dispatch_query(&cmd),
+            Message::Signal(cmd) => self.dispatch_signal(cmd),
             // Domains whose effects need the macOS layers are accepted but not
             // yet enacted here; report them rather than silently succeeding.
-            Message::Display(_) | Message::Rule(_) | Message::Signal(_) => {
+            Message::Display(_) | Message::Rule(_) => {
                 Err("domain not yet handled by AppState".to_string())
             }
         }
@@ -587,6 +592,107 @@ impl AppState {
             QueryTarget::Spaces => self.query_spaces(cmd),
             QueryTarget::Windows => self.query_windows(cmd),
         }
+    }
+
+    fn dispatch_signal(&mut self, cmd: SignalCommand) -> Response {
+        match cmd {
+            SignalCommand::Add(pairs) => {
+                let signal = Signal::from_key_values(&pairs)?;
+                // `event_signal_add` drops any prior signal with the same label.
+                if let Some(label) = &signal.label {
+                    self.signals.retain(|s| s.label.as_ref() != Some(label));
+                }
+                self.signals.push(signal);
+                Ok(None)
+            }
+            SignalCommand::Remove(selector) => self.remove_signal(selector.as_ref()),
+            SignalCommand::List => Ok(Some(self.serialize_signals())),
+        }
+    }
+
+    /// Remove a signal by index (global, in event-grouped order, like
+    /// `event_signal_remove_by_index`) or by label. Mirrors the C error text.
+    fn remove_signal(&mut self, selector: Option<&Selector>) -> Response {
+        match selector {
+            Some(Selector::Index(index)) => {
+                let order = self.signal_order();
+                match order.get(*index as usize) {
+                    Some(&pos) => {
+                        self.signals.remove(pos);
+                        Ok(None)
+                    }
+                    None => Err(format!("signal with index '{index}' not found.\n")),
+                }
+            }
+            Some(Selector::Label(label)) => {
+                match self
+                    .signals
+                    .iter()
+                    .position(|s| s.label.as_deref() == Some(label))
+                {
+                    Some(pos) => {
+                        self.signals.remove(pos);
+                        Ok(None)
+                    }
+                    None => Err(format!("signal with label '{label}' not found.\n")),
+                }
+            }
+            _ => Err("a valid signal selector (index or label) is required.\n".to_string()),
+        }
+    }
+
+    /// Indices into `self.signals` grouped by event in `SignalEvent::ALL` order,
+    /// matching the global ordering the C daemon assigns in `event_signal_list` /
+    /// `event_signal_remove_by_index`.
+    fn signal_order(&self) -> Vec<usize> {
+        let mut order = Vec::with_capacity(self.signals.len());
+        for event in SignalEvent::ALL {
+            for (pos, signal) in self.signals.iter().enumerate() {
+                if signal.event == event {
+                    order.push(pos);
+                }
+            }
+        }
+        order
+    }
+
+    /// Serialize all signals as the C `event_signal_list` does: event-grouped,
+    /// globally indexed, with `active` as `null`/`true`/`false`.
+    fn serialize_signals(&self) -> String {
+        let order = self.signal_order();
+        let mut out = String::from("[");
+        for (index, &pos) in order.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            let s = &self.signals[pos];
+            let active = match s.active {
+                None => "null",
+                Some(true) => "true",
+                Some(false) => "false",
+            };
+            out.push_str(&format!(
+                "{{\n\t\"index\":{index},\n\t\"label\":\"{}\",\n\t\"app\":\"{}\",\n\t\"title\":\"{}\",\n\t\"active\":{active},\n\t\"event\":\"{}\",\n\t\"action\":\"{}\"\n}}",
+                json_escape(s.label.as_deref().unwrap_or("")),
+                json_escape(s.app.as_deref().unwrap_or("")),
+                json_escape(s.title.as_deref().unwrap_or("")),
+                s.event.as_str(),
+                json_escape(&s.action),
+            ));
+        }
+        out.push_str("]\n");
+        out
+    }
+
+    /// The action commands of every signal subscribed to `event`, in registration
+    /// order. The daemon runs each with the appropriate `YABAI_*` env vars. The
+    /// `app`/`title` regex filters are not applied yet (see [`Signal`]).
+    pub fn signal_actions_for(&self, event: SignalEvent) -> Vec<String> {
+        self.signals
+            .iter()
+            .filter(|s| s.event == event)
+            .map(|s| s.action.clone())
+            .collect()
     }
 
     fn query_displays(&self, cmd: &QueryCommand) -> Response {
@@ -1713,6 +1819,96 @@ mod tests {
         assert_eq!(
             state.handle_tokens(&toks(&["bogus"])),
             Err("unknown domain 'bogus'".to_string())
+        );
+    }
+
+    #[test]
+    fn signals_add_list_remove_and_fire() {
+        let mut state = AppState::new();
+        // Add two signals on different events plus one sharing a label to replace.
+        state
+            .handle_tokens(&toks(&[
+                "signal",
+                "--add",
+                "event=window_focused",
+                "action=echo focus",
+                "label=a",
+            ]))
+            .unwrap();
+        state
+            .handle_tokens(&toks(&[
+                "signal",
+                "--add",
+                "event=application_launched",
+                "action=echo launch",
+            ]))
+            .unwrap();
+        // Re-adding label `a` replaces the first signal's action.
+        state
+            .handle_tokens(&toks(&[
+                "signal",
+                "--add",
+                "event=window_focused",
+                "action=echo refocus",
+                "label=a",
+            ]))
+            .unwrap();
+
+        // Firing resolves by event in registration order.
+        assert_eq!(
+            state.signal_actions_for(SignalEvent::WindowFocused),
+            vec!["echo refocus".to_string()]
+        );
+        assert_eq!(
+            state.signal_actions_for(SignalEvent::ApplicationLaunched),
+            vec!["echo launch".to_string()]
+        );
+        assert!(
+            state
+                .signal_actions_for(SignalEvent::SpaceChanged)
+                .is_empty()
+        );
+
+        // `--list` is event-grouped (application_* before window_*) and indexed.
+        let list = state
+            .handle_tokens(&toks(&["signal", "--list"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            list,
+            "[{\n\t\"index\":0,\n\t\"label\":\"\",\n\t\"app\":\"\",\n\t\"title\":\"\",\n\t\"active\":null,\n\t\"event\":\"application_launched\",\n\t\"action\":\"echo launch\"\n},{\n\t\"index\":1,\n\t\"label\":\"a\",\n\t\"app\":\"\",\n\t\"title\":\"\",\n\t\"active\":null,\n\t\"event\":\"window_focused\",\n\t\"action\":\"echo refocus\"\n}]\n"
+        );
+
+        // Remove by label, then the remaining one by index 0.
+        state
+            .handle_tokens(&toks(&["signal", "--remove", "a"]))
+            .unwrap();
+        assert!(
+            state
+                .signal_actions_for(SignalEvent::WindowFocused)
+                .is_empty()
+        );
+        state
+            .handle_tokens(&toks(&["signal", "--remove", "0"]))
+            .unwrap();
+        assert!(
+            state
+                .signal_actions_for(SignalEvent::ApplicationLaunched)
+                .is_empty()
+        );
+
+        // Missing label / index errors carry the C text.
+        assert!(
+            state
+                .handle_tokens(&toks(&["signal", "--remove", "ghost"]))
+                .unwrap_err()
+                .contains("signal with label 'ghost' not found")
+        );
+        assert!(
+            state
+                .handle_tokens(&toks(&["signal", "--remove", "9"]))
+                .unwrap_err()
+                .contains("signal with index '9' not found")
         );
     }
 }

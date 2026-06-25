@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use yabai_core::{
-    Area, Message, Selector, SpaceAction, WindowAction, parse_message, parse_selector,
+    Area, Message, Selector, SignalEvent, SpaceAction, WindowAction, parse_message, parse_selector,
 };
 use yabai_ipc::{FAILURE_MARKER, daemon_socket_path, decode_client_payload, send_message};
 use yabai_macos::ax::DiscoveredAxWindow;
@@ -840,12 +840,23 @@ fn run_space_probe(args: &[String]) -> ExitCode {
 /// resolves the target into `focused_window`, and the daemon then raises the real
 /// window. A bare `window --focus` (no selector) carries no target, so it's not
 /// treated as a focus move.
+/// True if `tokens` request a window focus in either grammar form:
+/// `window --focus <selector>` (the action carries the selector) or
+/// `window <selector> --focus` (the leading target is the window to focus). A
+/// bare `window --focus` with no target and no selector is not a focus request.
 fn is_window_focus(tokens: &[String]) -> bool {
-    matches!(
-        parse_message(tokens),
-        Ok(Message::Window(cmd))
-            if cmd.actions.iter().any(|action| matches!(action, WindowAction::Focus(Some(_))))
-    )
+    let Ok(Message::Window(cmd)) = parse_message(tokens) else {
+        return false;
+    };
+    let has_focus_action = cmd
+        .actions
+        .iter()
+        .any(|action| matches!(action, WindowAction::Focus(_)));
+    let has_focus_selector = cmd
+        .actions
+        .iter()
+        .any(|action| matches!(action, WindowAction::Focus(Some(_))));
+    has_focus_action && (cmd.target.is_some() || has_focus_selector)
 }
 
 /// True if `tokens` is a `window --minimize` command.
@@ -1106,6 +1117,21 @@ fn resolve_space_target(
 /// (which robustly handles closes despite unreliable AX destroy notifications),
 /// then re-flow the active layout. Windows outside the seeded first-display
 /// spaces are ignored, which also drops windows moved to untracked displays.
+/// Fire every signal subscribed to `event`, running each action as
+/// `/usr/bin/env sh -c <action>` with the given `YABAI_*` env vars set, mirroring
+/// the C `event_signal_flush` (`fork` + `execvp`). Fire-and-forget: a child is
+/// spawned and not awaited, and spawn failures are ignored, like the daemon.
+fn fire_signals(runtime: &Runtime<AxSink>, event: SignalEvent, env: &[(&str, String)]) {
+    for action in runtime.state.signal_actions_for(event) {
+        let mut cmd = std::process::Command::new("/usr/bin/env");
+        cmd.arg("sh").arg("-c").arg(&action);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let _ = cmd.spawn();
+    }
+}
+
 fn reconcile_pid(
     runtime: &mut Runtime<AxSink>,
     managed: &mut HashMap<i32, HashSet<u32>>,
@@ -1337,6 +1363,10 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
     }
     let initial: usize = managed.values().map(HashSet::len).sum();
 
+    // Most-recently signaled focused window, so `window_focused` fires once per
+    // real focus change whether the change came from a command or an AX observer.
+    let mut last_focus_signal: Option<u32> = None;
+
     // Unified event loop: observers, the periodic tick, and the socket all feed
     // one channel processed against the single `Runtime<AxSink>`.
     let (tx, rx) = channel::<WmWork>();
@@ -1407,6 +1437,16 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                             .state
                             .handle_event(StateEvent::WindowFocused { window_id });
                     }
+                    // `window_focused` signal (observer-driven focus, e.g. a
+                    // click). De-duplicated against the command path below.
+                    if last_focus_signal != Some(window_id) {
+                        last_focus_signal = Some(window_id);
+                        fire_signals(
+                            &runtime,
+                            SignalEvent::WindowFocused,
+                            &[("YABAI_WINDOW_ID", window_id.to_string())],
+                        );
+                    }
                 }
             }
             WmWork::Workspace(event) => match event {
@@ -1415,8 +1455,22 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                     for pid in observed.iter().copied().collect::<Vec<_>>() {
                         reconcile_pid(&mut runtime, &mut managed, pid);
                     }
+                    if let Some(sid) = runtime.state.active_space_id() {
+                        fire_signals(
+                            &runtime,
+                            SignalEvent::SpaceChanged,
+                            &[("YABAI_SPACE_ID", sid.to_string())],
+                        );
+                    }
                 }
                 WorkspaceEvent::ApplicationLaunched { pid } => {
+                    // Fire the signal regardless of tiling mode; it is about the
+                    // event, not whether this daemon manages the app.
+                    fire_signals(
+                        &runtime,
+                        SignalEvent::ApplicationLaunched,
+                        &[("YABAI_PROCESS_ID", pid.to_string())],
+                    );
                     if is_all && observed.insert(pid) {
                         spawn_observer(pid, &tx);
                         refresh_live_display_state(&mut runtime, &mut display_frames);
@@ -1424,6 +1478,11 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                     }
                 }
                 WorkspaceEvent::ApplicationTerminated { pid } => {
+                    fire_signals(
+                        &runtime,
+                        SignalEvent::ApplicationTerminated,
+                        &[("YABAI_PROCESS_ID", pid.to_string())],
+                    );
                     if observed.remove(&pid) {
                         for window_id in minimized_pids
                             .iter()
@@ -1497,6 +1556,17 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                 if response.is_ok() && is_window_focus(&tokens) {
                     if let Some(window_id) = runtime.state.focused_window_id() {
                         runtime.sink.focus_window(window_id);
+                        // Fire `window_focused` here too: command-driven focus does
+                        // not always produce an AX observer notification. De-dup
+                        // with the observer path via `last_focus_signal`.
+                        if last_focus_signal != Some(window_id) {
+                            last_focus_signal = Some(window_id);
+                            fire_signals(
+                                &runtime,
+                                SignalEvent::WindowFocused,
+                                &[("YABAI_WINDOW_ID", window_id.to_string())],
+                            );
+                        }
                     }
                 }
                 // `window --minimize`: AX-minimize the focused window, then

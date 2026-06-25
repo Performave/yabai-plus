@@ -20,8 +20,10 @@ reconstructing context.
   `first`, and `last` selectors restored from the daemon's minimized-window AX
   registry, and `window --close` is wired through the AX close button.
   `window --toggle native-fullscreen` enters/exits via the `AXFullScreen`
-  attribute with a fullscreen AX registry mirroring minimize. 129 workspace
-  tests pass. The shipped C `make` flow is unchanged.
+  attribute with a fullscreen AX registry mirroring minimize. The `signal` domain
+  is modeled and executed: `signal --add/--list/--remove` plus live firing of
+  `window_focused`, `application_launched/terminated`, and `space_changed`
+  actions. 133 workspace tests pass. The shipped C `make` flow is unchanged.
 - Last updated: 2026-06-25.
 - User decisions captured:
   - The Rust rewrite may diverge permanently from upstream yabai. Rebaseability is no
@@ -32,6 +34,47 @@ reconstructing context.
     forcing literal Rust at the cost of fragile injection behavior.
 
 ## Progress log
+
+### 2026-06-25 (session 9) — signals
+
+- The `signal` domain is now modeled and executed, ported from
+  `src/event_signal.{h,c}` and `handle_domain_signal`. New pure
+  `yabai-core::signal` holds `SignalEvent` (all `enum signal_type` variants, in
+  order, with `as_str`/`from_name` mirroring `signal_type_str` /
+  `signal_type_from_string`) and `Signal` + `Signal::from_key_values`, which
+  reproduces the C `daemon_fail` validation text (unknown key, missing
+  `event=..`/`action=..`, `active` value domain, `!` exclusion restriction).
+- `AppState` owns a `Vec<Signal>` registry and `dispatch_signal`: `--add`
+  (replacing a prior same-label signal, like `event_signal_add`), `--remove` by
+  index (global, event-grouped order, matching `event_signal_remove_by_index`) or
+  label, and `--list` serialized exactly like `event_signal_list` (event-grouped,
+  globally indexed, `active` as `null`/`true`/`false`). `signal_actions_for(event)`
+  returns the action commands the daemon should run.
+- The WM daemon fires signals with the matching `YABAI_*` env vars via a new
+  `fire_signals` (`/usr/bin/env sh -c <action>`, fire-and-forget, mirroring the C
+  `fork`/`execvp`): `window_focused` (`YABAI_WINDOW_ID`),
+  `application_launched`/`application_terminated` (`YABAI_PROCESS_ID`), and
+  `space_changed` (`YABAI_SPACE_ID`). `window_focused` fires from both the AX
+  observer and the command focus path, de-duplicated via a `last_focus_signal`
+  tracker so a single real focus change fires once.
+- Fixed a latent focus bug found while testing: `is_window_focus` only matched the
+  `window --focus <sel>` form, so `window <id> --focus` (selector as the leading
+  target) never enacted the real AX raise (or the focus signal). It now treats a
+  window command with a `Focus` action plus either a target or a focus selector as
+  a focus request, covering both grammar forms.
+- Deferred (documented): `app`/`title` regex filters on signals (the C compiles
+  POSIX `REG_EXTENDED`; adding a regex engine is a separate decision — fields are
+  stored but not matched), and `window_created`/`window_destroyed` and the other
+  events, because reconcile-based detection cannot yet distinguish a real
+  create/destroy from minimize/fullscreen/space-move churn.
+- Live remote verification on macOS 26.2: WM daemon over Finder on isolated
+  socket; `signal --add event=window_focused action='echo focused:$YABAI_WINDOW_ID
+  >> /tmp/sigfire.log'`, then `window <id> --focus` for three windows wrote
+  `focused:767`, `focused:766`, `focused:54` — one line per focus change with the
+  correct id exported. `signal --list`/`--remove` (label and index) plus the
+  validation errors were verified locally through the dry-run daemon.
+- Verification: `cargo fmt --all`; `cargo test --workspace` (133 tests);
+  `cargo clippy --workspace --all-targets`; `cargo build --release -p yabai`.
 
 ### 2026-06-25 (session 8) — native fullscreen
 
@@ -1090,6 +1133,10 @@ chronological log and may describe earlier states.
   - `command.rs`: typed model for ALL 7 domains (`parse_config`/`display`/
     `space`/`window`/`query`/`rule`/`signal`) + `parse_message` dispatcher ->
     `Message`. `ParseError` `Display` text matches the C `daemon_fail` strings.
+  - `signal.rs`: `SignalEvent` (all `enum signal_type` variants in order) +
+    `Signal` + `Signal::from_key_values` (faithful `handle_domain_signal`
+    validation). The runtime stores/serializes/fires these; `app`/`title` regex
+    matching is deferred.
 - `crates/yabai-ipc` (6 tests) — client wire framing + `send_message`; the
   `crates/yabai` binary `-m` path uses it and talks to the live C daemon.
 - `crates/yabai-runtime` (31 tests) — the control plane, depends on `yabai-core`:
@@ -1166,7 +1213,8 @@ discovered windows to the display/space they're physically on. Active-space
 changes are notified through NSWorkspace; app launch/termination are notified
 too; space add/remove is refreshed by polling before daemon work. Window ops:
 focus (raise), close, swap, warp, minimize/deminimize, toggle
-float/zoom/native-fullscreen; space focus (gesture) and rotate/balance/mirror/layout.
+float/zoom/native-fullscreen; space focus (gesture) and rotate/balance/mirror/layout;
+`signal` add/list/remove with live firing on focus/app/space events.
 
 ### Do these next, in order (Phase 5/6 breadth — the big remaining work)
 
@@ -1191,9 +1239,15 @@ float/zoom/native-fullscreen; space focus (gesture) and rotate/balance/mirror/la
    focused window; exit via id/`first`/`last`/single-window bare toggle),
    `--minimize`, `--deminimize` for numeric ids and `first`/`last`; `--swap`
    already worked. Still to do: remaining deminimize/native-fullscreen-exit
-   selectors, focus without-raise, sticky/scratchpad, opacity/layer (opacity needs
-   the scripting addition — `scripting_addition_set_opacity`); mouse drag
-   move/resize/swap; rules + signals execution.
+   selectors, focus without-raise, sticky/scratchpad, opacity/layer (opacity/layer/
+   sticky/shadow all need the scripting addition — `scripting_addition_set_*`);
+   mouse drag move/resize/swap.
+   Signals: done — `signal --add/--list/--remove` and live firing of
+   `window_focused`, `application_launched/terminated`, `space_changed` (with
+   `YABAI_*` env vars). Still to do: signal `app`/`title` regex filters (needs a
+   regex engine), the remaining signal events (`window_created/destroyed` etc.,
+   blocked on disambiguating reconcile churn), and `rule` execution (also wants
+   regex for app/title matching).
 5. Then Phases 7-9: scripting addition (`yabai-sa`, currently empty — required
    for space management / cross-space moves on modern macOS), OSAX spike, and
    production packaging (wire the Rust binary into `make`, signing, notarization,

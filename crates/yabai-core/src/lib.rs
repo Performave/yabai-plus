@@ -2,6 +2,7 @@ pub mod command;
 pub mod geometry;
 pub mod layout;
 pub mod parser;
+pub mod signal;
 
 pub use command::{
     ConfigCommand, ConfigOp, ConfigValue, DisplayAction, DisplayCommand, Domain, FfmMode, Message,
@@ -19,3 +20,4 @@ pub use parser::{
     parse_key_value, parse_layout, parse_resize_handle, parse_selector, parse_split_type,
     parse_value_type, parse_window_placement,
 };
+pub use signal::{Signal, SignalEvent};
