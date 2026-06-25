@@ -596,35 +596,6 @@ fn managed_space_for_window(state: &AppState, window_id: u32) -> Option<u64> {
     spaces.into_iter().find(|sid| state.space(*sid).is_some())
 }
 
-fn refresh_display_spaces(runtime: &mut Runtime<AxSink>, display_id: u32, usable: Area) {
-    let Ok(sids) = spaces_for_display(display_id) else {
-        return;
-    };
-    if sids.is_empty() {
-        return;
-    }
-
-    let current = sids.iter().copied().collect::<HashSet<_>>();
-    for sid in &sids {
-        if runtime.state.space(*sid).is_none() {
-            let _ = runtime
-                .state
-                .handle_event(StateEvent::SpaceCreatedOnDisplay {
-                    sid: *sid,
-                    display_id,
-                    frame: usable,
-                });
-            let _ = runtime.state.set_space_frame(*sid, usable);
-        }
-    }
-
-    for sid in runtime.state.space_ids_for_display(display_id) {
-        if !current.contains(&sid) {
-            let _ = runtime.state.handle_event(StateEvent::SpaceRemoved { sid });
-        }
-    }
-}
-
 /// Track `display_id`'s currently visible space and re-tile every display if it
 /// changed (a space switch on any display reflows that display's new space).
 fn refresh_display_active_space(runtime: &mut Runtime<AxSink>, display_id: u32) {
@@ -640,17 +611,103 @@ fn refresh_display_active_space(runtime: &mut Runtime<AxSink>, display_id: u32) 
     runtime.state.flush_all_active_to(&mut runtime.sink);
 }
 
-/// Discover spaces (add/remove) for every display, each inside its own frame.
-fn refresh_all_display_spaces(runtime: &mut Runtime<AxSink>, display_frames: &[(u32, Area)]) {
-    for (display_id, usable) in display_frames {
-        refresh_display_spaces(runtime, *display_id, *usable);
-    }
-}
-
 /// Refresh the currently visible space of every display.
 fn refresh_all_active_spaces(runtime: &mut Runtime<AxSink>, display_frames: &[(u32, Area)]) {
     for (display_id, _) in display_frames {
         refresh_display_active_space(runtime, *display_id);
+    }
+}
+
+/// Re-read the live display topology and space/display ownership. This handles
+/// display hot-plug and also preserves a space's existing tree when macOS rehomes
+/// that same space id onto a different display.
+fn refresh_live_display_state(
+    runtime: &mut Runtime<AxSink>,
+    display_frames: &mut Vec<(u32, Area)>,
+) {
+    let displays = match active_displays() {
+        Ok(displays) => displays,
+        Err(error) => {
+            eprintln!("yabai-rust: failed to refresh displays: {error}");
+            return;
+        }
+    };
+    if displays.is_empty() {
+        return;
+    }
+
+    let mut refreshed_frames = Vec::with_capacity(displays.len());
+    let mut active_display_ids = HashSet::with_capacity(displays.len());
+    let mut live_space_ids = HashSet::new();
+    let mut complete_space_snapshot = true;
+
+    for display in displays {
+        active_display_ids.insert(display.id);
+        let usable = visible_frame_for_display(display.id).unwrap_or(display.frame);
+        refreshed_frames.push((display.id, usable));
+        let _ = runtime.state.handle_event(StateEvent::DisplayCreated {
+            display_id: display.id,
+            frame: display.frame,
+        });
+
+        let mut spaces = match spaces_for_display(display.id) {
+            Ok(spaces) => spaces,
+            Err(error) => {
+                complete_space_snapshot = false;
+                eprintln!(
+                    "yabai-rust: failed to refresh spaces for display {}: {error}",
+                    display.id
+                );
+                Vec::new()
+            }
+        };
+        let current = current_space_for_display(display.id).ok();
+        if let Some(current) = current {
+            if !spaces.contains(&current) {
+                spaces.push(current);
+            }
+        }
+
+        for sid in spaces {
+            live_space_ids.insert(sid);
+            let _ = runtime
+                .state
+                .handle_event(StateEvent::SpaceCreatedOnDisplay {
+                    sid,
+                    display_id: display.id,
+                    frame: usable,
+                });
+            let _ = runtime.state.set_space_frame(sid, usable);
+        }
+
+        if let Some(current) = current {
+            if runtime.state.space(current).is_some() {
+                runtime.state.set_display_active_space(display.id, current);
+            }
+        }
+    }
+
+    if complete_space_snapshot {
+        for sid in runtime.state.space_ids() {
+            if !live_space_ids.contains(&sid) {
+                let _ = runtime.state.handle_event(StateEvent::SpaceRemoved { sid });
+            }
+        }
+    }
+
+    for display_id in runtime.state.display_ids() {
+        if !active_display_ids.contains(&display_id) {
+            let _ = runtime
+                .state
+                .handle_event(StateEvent::DisplayRemoved { display_id });
+        }
+    }
+
+    let frames_changed = *display_frames != refreshed_frames;
+    *display_frames = refreshed_frames;
+    refresh_all_active_spaces(runtime, display_frames);
+    if frames_changed {
+        runtime.state.flush_all_active_to(&mut runtime.sink);
     }
 }
 
@@ -1016,7 +1073,7 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
     };
     // Each display tiles inside its own visible frame (per-display menu bar/Dock
     // insets); fall back to the full bounds if NSScreen can't resolve it.
-    let display_frames: Vec<(u32, Area)> = displays
+    let mut display_frames: Vec<(u32, Area)> = displays
         .iter()
         .map(|display| {
             (
@@ -1134,8 +1191,7 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                     } => Some(*id),
                     _ => None,
                 };
-                refresh_all_display_spaces(&mut runtime, &display_frames);
-                refresh_all_active_spaces(&mut runtime, &display_frames);
+                refresh_live_display_state(&mut runtime, &mut display_frames);
                 reconcile_pid(&mut runtime, &mut managed, pid);
                 // Focus may have moved to a window on another display; point the
                 // command-active space at the focused window's space.
@@ -1150,8 +1206,7 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
             }
             WmWork::Workspace(event) => match event {
                 WorkspaceEvent::ActiveSpaceChanged => {
-                    refresh_all_display_spaces(&mut runtime, &display_frames);
-                    refresh_all_active_spaces(&mut runtime, &display_frames);
+                    refresh_live_display_state(&mut runtime, &mut display_frames);
                     for pid in observed.iter().copied().collect::<Vec<_>>() {
                         reconcile_pid(&mut runtime, &mut managed, pid);
                     }
@@ -1159,8 +1214,7 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                 WorkspaceEvent::ApplicationLaunched { pid } => {
                     if is_all && observed.insert(pid) {
                         spawn_observer(pid, &tx);
-                        refresh_all_display_spaces(&mut runtime, &display_frames);
-                        refresh_all_active_spaces(&mut runtime, &display_frames);
+                        refresh_live_display_state(&mut runtime, &mut display_frames);
                         reconcile_pid(&mut runtime, &mut managed, pid);
                     }
                 }
@@ -1171,8 +1225,7 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                 }
             },
             WmWork::Tick => {
-                refresh_all_display_spaces(&mut runtime, &display_frames);
-                refresh_all_active_spaces(&mut runtime, &display_frames);
+                refresh_live_display_state(&mut runtime, &mut display_frames);
                 // In `all` mode, pick up apps launched after startup via the live
                 // CGWindowList scan, and start observing each.
                 if is_all {
@@ -1189,8 +1242,7 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                 }
             }
             WmWork::Message { tokens, reply } => {
-                refresh_all_display_spaces(&mut runtime, &display_frames);
-                refresh_all_active_spaces(&mut runtime, &display_frames);
+                refresh_live_display_state(&mut runtime, &mut display_frames);
                 // A lone `space --focus <sel>` needs a macOS-layer space switch the
                 // pure core can't perform; handle it here, otherwise fall through.
                 let response = match try_space_focus(&mut runtime, &display_frames, &tokens) {

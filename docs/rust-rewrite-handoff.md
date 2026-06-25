@@ -15,8 +15,9 @@ reconstructing context.
   (`AppState` + `Config` + `Runtime` flush + single-threaded `Actor`) plus the
   first pure query serializer for windows/spaces/displays; and `yabai-macos` has
   the first real `LayoutSink` (`AxSink`) moving windows via the Accessibility API
-  plus live CoreGraphics display discovery and AX window diagnostics. 105
-  workspace tests pass. The shipped C `make` flow is unchanged.
+  plus live CoreGraphics display discovery, display/space topology reconciliation,
+  and AX window diagnostics. 122 workspace tests pass. The shipped C `make` flow
+  is unchanged.
 - Last updated: 2026-06-25.
 - User decisions captured:
   - The Rust rewrite may diverge permanently from upstream yabai. Rebaseability is no
@@ -27,6 +28,39 @@ reconstructing context.
     forcing literal Rust at the cost of fragile injection behavior.
 
 ## Progress log
+
+### 2026-06-25 (session 4) — display hot-plug
+
+- The Rust WM daemon no longer treats `display_frames` as a startup-only snapshot.
+  New `refresh_live_display_state(&mut Runtime<AxSink>, &mut Vec<(u32, Area)>)`
+  re-enumerates `active_displays`, recomputes per-display usable frames,
+  registers/removes displays in `AppState`, refreshes every display's current
+  space, and rebuilds the daemon's `display_frames` cache. The event loop calls it
+  before every AX-observed event, active-space/app-launch workspace event, periodic
+  tick, and socket message, so topology changes are picked up on the next daemon
+  work item (at worst the 3s tick).
+- Space refresh is now global instead of per-display destructive. The reconcile
+  gathers every `spaces_for_display(did)` result into one live-space set before
+  removing missing spaces, so a space that keeps the same sid but is rehomed onto
+  another display preserves its BSP tree and just updates `space_displays` plus its
+  frame. Transient `spaces_for_display` failures are treated as incomplete
+  snapshots and do **not** delete existing spaces.
+- `AppState::add_space_to_display` now preserves an existing space tree instead of
+  replacing it; `remove_display` clears `display_active_space`; `remove_space`
+  clears any display-active entry pointing at the removed sid. Added
+  `space_ids()`/`display_ids()` helpers and tests for rehomed-space tree
+  preservation plus display-removal cleanup.
+- Live remote verification on macOS 26.2: deployed a release binary, probed two
+  active displays (external 1920x1080 with spaces `[1, 12]`, built-in Retina with
+  one display-local space), then ran `--experimental-rust-wm-daemon` in `all` mode
+  on an isolated socket. `query --displays` returned both displays / all three
+  spaces, and `query --windows` showed three Finder windows tiled across both
+  displays. User-assisted physical hot-plug was also verified: with the daemon
+  running, unplugging the external changed both the probe and daemon query from two
+  displays to one (`display 1`, spaces `[1, 12]`), and replugging changed both back
+  to two displays with the newly-created display-local space sid.
+- Verification: `cargo fmt --all`; `cargo test --workspace` (122 tests);
+  `cargo clippy --workspace --all-targets`; `cargo build --release -p yabai`.
 
 ### 2026-06-25 (session 3) — multi-display
 
@@ -50,8 +84,8 @@ reconstructing context.
   the daemon (it re-tiles before macOS reassigns the window's space); routing is
   correct when a window's space is discovered at startup/reconcile. A real
   `window --display` / `space --display` move needs the scripting addition
-  (Phase 8). Display hot-plug isn't handled yet (displays are enumerated once at
-  startup). The `--experimental-space-probe` now prints every display's
+  (Phase 8). At this point display hot-plug was still deferred (fixed in session
+  4). The `--experimental-space-probe` now prints every display's
   bounds/usable/current-space.
 
 ### 2026-06-25 (session 2)
@@ -1039,10 +1073,11 @@ rotate/balance/mirror/layout.
    scripting addition, Phase 8); cross-display cursor warp in the focus gesture;
    and, later, SLS create/destroy notifications.
 2. Multi-display: done — the daemon tiles every display's current space at once,
-   each in its own usable frame, routing windows to the display they're on. Still
-   to do: display hot-plug (re-enumerate on change), cross-display window/space
-   moves (`window --display` / `space --display`, need the scripting addition),
-   and the cross-display cursor warp in the space-focus gesture.
+   each in its own usable frame, routing windows to the display they're on.
+   Display hot-plug is handled by polling/reconcile before daemon work and on the
+   3s tick (physically verified unplug/replug). Still to do: cross-display
+   window/space moves (`window --display` / `space --display`, need the scripting
+   addition), and the cross-display cursor warp in the space-focus gesture.
 3. App launch/termination are now observed directly through NSWorkspace; the 3s
    tick remains a backstop for missed AX/window changes and CGWindowList pickup.
 4. More window ops needing live state: done — `window --focus` with-raise

@@ -129,7 +129,14 @@ impl AppState {
 
     pub fn remove_display(&mut self, display_id: u32) {
         self.displays.remove(&display_id);
+        self.display_active_space.remove(&display_id);
         self.space_displays.retain(|_, did| *did != display_id);
+    }
+
+    pub fn display_ids(&self) -> Vec<u32> {
+        let mut display_ids = self.displays.keys().copied().collect::<Vec<_>>();
+        display_ids.sort_unstable();
+        display_ids
     }
 
     /// Register (or replace) a space's layout tree with the given area, using
@@ -144,7 +151,9 @@ impl AppState {
 
     /// Register a space and associate it with a display.
     pub fn add_space_to_display(&mut self, sid: u64, display_id: u32, area: Area) {
-        self.add_space(sid, area);
+        if !self.spaces.contains_key(&sid) {
+            self.add_space(sid, area);
+        }
         self.space_displays.insert(sid, display_id);
     }
 
@@ -158,9 +167,17 @@ impl AppState {
             }
         }
         self.space_displays.remove(&sid);
+        self.display_active_space
+            .retain(|_, active_sid| *active_sid != sid);
         if self.active_space == Some(sid) {
             self.active_space = self.spaces.keys().copied().min();
         }
+    }
+
+    pub fn space_ids(&self) -> Vec<u64> {
+        let mut space_ids = self.spaces.keys().copied().collect::<Vec<_>>();
+        space_ids.sort_unstable();
+        space_ids
     }
 
     pub fn space_ids_for_display(&self, display_id: u32) -> Vec<u64> {
@@ -1383,6 +1400,7 @@ mod tests {
     fn space_removed_drops_tree_and_active_space() {
         let mut state = state_with_displays();
         state.set_active_space(2);
+        state.set_display_active_space(77, 2);
         state
             .handle_event(StateEvent::WindowAssignedToSpace {
                 window_id: 20,
@@ -1397,7 +1415,48 @@ mod tests {
         assert!(state.space(2).is_none());
         assert_eq!(state.space_ids_for_display(77), Vec::<u64>::new());
         assert_eq!(state.active_space_id(), Some(1));
+        assert_eq!(state.display_active_space_id(77), None);
         assert_eq!(state.focused_window, None);
+    }
+
+    #[test]
+    fn rediscovered_space_on_new_display_preserves_tree() {
+        let mut state = state_with_displays();
+        state.set_active_space(1);
+        state
+            .handle_event(StateEvent::WindowAssignedToSpace {
+                window_id: 10,
+                sid: 1,
+            })
+            .unwrap();
+        state
+            .handle_event(StateEvent::WindowAssignedToSpace {
+                window_id: 20,
+                sid: 1,
+            })
+            .unwrap();
+
+        state.add_space_to_display(1, 77, Area::new(1440.0, 0.0, 1280.0, 720.0));
+        state
+            .set_space_frame(1, Area::new(1440.0, 0.0, 1280.0, 720.0))
+            .unwrap();
+
+        assert_eq!(state.space_ids_for_display(42), Vec::<u64>::new());
+        assert_eq!(state.space_ids_for_display(77), vec![1, 2]);
+        assert_eq!(state.space(1).unwrap().window_list(), vec![10, 20]);
+        assert_eq!(state.flush(1).unwrap()[0].area.x as i32, 1440);
+    }
+
+    #[test]
+    fn display_removed_clears_active_display_space() {
+        let mut state = state_with_displays();
+        state.set_display_active_space(77, 2);
+
+        state.remove_display(77);
+
+        assert_eq!(state.display_ids(), vec![42]);
+        assert_eq!(state.display_active_space_id(77), None);
+        assert_eq!(state.space_ids_for_display(77), Vec::<u64>::new());
     }
 
     #[test]
