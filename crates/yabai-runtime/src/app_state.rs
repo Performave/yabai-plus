@@ -527,6 +527,13 @@ impl AppState {
                             }
                         }
                     }
+                    "native-fullscreen" => {
+                        // Validated no-op: the macOS layer (daemon) toggles
+                        // AXFullscreen and reconcile drops the window from the tree
+                        // as it leaves for its own fullscreen space (re-added when
+                        // toggled back off). Mirrors how minimize is handled.
+                        self.require_focused()?;
+                    }
                     // Other toggles (sticky/split/shadow) need state the pure /
                     // macOS layers don't model yet.
                     _ => return Err(format!("window toggle '{name}' not yet handled")),
@@ -1153,6 +1160,27 @@ mod tests {
         assert!(
             state
                 .handle_tokens(&toks(&["window", "--minimize"]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_fullscreen_toggle_requires_a_focused_window() {
+        let mut state = state_with_space();
+        state.add_window(1).unwrap();
+        // Focused after add: the toggle validates and is a pure no-op (the daemon
+        // sets AXFullscreen and reconcile drops the window from the tree).
+        assert_eq!(
+            state.handle_tokens(&toks(&["window", "--toggle", "native-fullscreen"])),
+            Ok(None)
+        );
+        assert_eq!(state.space(1).unwrap().window_list(), vec![1]);
+        // With nothing focused (e.g. the window already left for its fullscreen
+        // space), the pure layer errors and the daemon's exit intercept takes over.
+        state.set_focused_window(None);
+        assert!(
+            state
+                .handle_tokens(&toks(&["window", "--toggle", "native-fullscreen"]))
                 .is_err()
         );
     }

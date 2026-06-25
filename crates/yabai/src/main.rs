@@ -942,6 +942,80 @@ fn try_window_deminimize(
     Some(Ok(None))
 }
 
+/// True if `tokens` is a `window [sel] --toggle native-fullscreen` command.
+fn is_window_native_fullscreen(tokens: &[String]) -> bool {
+    matches!(
+        parse_message(tokens),
+        Ok(Message::Window(cmd))
+            if cmd.actions.iter().any(|action| matches!(
+                action,
+                WindowAction::Toggle(name) if name == "native-fullscreen"
+            ))
+    )
+}
+
+/// Resolve the target of `window [sel] --toggle native-fullscreen` against the
+/// set of windows currently in native fullscreen (which have left the layout
+/// trees). The outer `Option` distinguishes "not this toggle" (`None`) from "this
+/// toggle"; the inner `Option` is the resolved fullscreen window id, or `None`
+/// when no fullscreen window matches — meaning this is an *enter* request that
+/// the normal command path handles. Numeric ids, `first`/`last`, and a bare
+/// command when exactly one window is fullscreen are resolved here.
+fn window_fullscreen_exit_target(tokens: &[String], fullscreen_ids: &[u32]) -> Option<Option<u32>> {
+    let Ok(Message::Window(cmd)) = parse_message(tokens) else {
+        return None;
+    };
+    let [WindowAction::Toggle(name)] = cmd.actions.as_slice() else {
+        return None;
+    };
+    if name != "native-fullscreen" {
+        return None;
+    }
+    let resolved = match cmd.target.as_ref() {
+        Some(Selector::Index(id)) if fullscreen_ids.contains(id) => Some(*id),
+        Some(Selector::First) => fullscreen_ids.first().copied(),
+        Some(Selector::Last) => fullscreen_ids.last().copied(),
+        None if fullscreen_ids.len() == 1 => fullscreen_ids.first().copied(),
+        _ => None,
+    };
+    Some(resolved)
+}
+
+/// Intercept the *exit* half of `window <sel> --toggle native-fullscreen`: a
+/// fullscreen window has left the layout trees, so the pure core cannot act on
+/// it. When `tokens` resolves to a registered-fullscreen window, clear its
+/// `AXFullscreen` attribute and reconcile its app back into the layout. Returns
+/// `None` for an *enter* request (no fullscreen target), letting the normal
+/// command path validate the focused window so the post-step enters fullscreen.
+fn try_window_native_fullscreen_exit(
+    runtime: &mut Runtime<AxSink>,
+    managed: &mut HashMap<i32, HashSet<u32>>,
+    fullscreen_pids: &mut HashMap<u32, i32>,
+    tokens: &[String],
+) -> Option<Response> {
+    let fullscreen_ids = runtime.sink.fullscreen_window_ids();
+    let window_id = window_fullscreen_exit_target(tokens, &fullscreen_ids)??;
+
+    if !runtime.sink.is_fullscreen_registered(window_id) {
+        return None;
+    }
+    let Some(pid) = fullscreen_pids.remove(&window_id) else {
+        runtime.sink.unregister_fullscreen(window_id);
+        return Some(Err(format!(
+            "could not exit fullscreen for window with id '{window_id}'."
+        )));
+    };
+    if !runtime.sink.exit_native_fullscreen(window_id) {
+        fullscreen_pids.insert(window_id, pid);
+        return Some(Err(format!(
+            "could not exit fullscreen for window with id '{window_id}'."
+        )));
+    }
+
+    reconcile_pid(runtime, managed, pid);
+    Some(Ok(None))
+}
+
 /// Intercept a standalone `space --focus <selector>` and enact the active-space
 /// switch through the macOS layer, returning `Some(response)`. Any other message
 /// (including a `--focus` mixed with other actions) returns `None` so the caller
@@ -1255,6 +1329,7 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
     let mut runtime = Runtime::new(state, AxSink::new());
     let mut managed: HashMap<i32, HashSet<u32>> = HashMap::new();
     let mut minimized_pids: HashMap<u32, i32> = HashMap::new();
+    let mut fullscreen_pids: HashMap<u32, i32> = HashMap::new();
 
     // Initial tile from the current world.
     for pid in &pids {
@@ -1360,6 +1435,16 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                             minimized_pids.remove(&window_id);
                             runtime.sink.unregister_minimized(window_id);
                         }
+                        for window_id in fullscreen_pids
+                            .iter()
+                            .filter_map(|(&window_id, &window_pid)| {
+                                (window_pid == pid).then_some(window_id)
+                            })
+                            .collect::<Vec<_>>()
+                        {
+                            fullscreen_pids.remove(&window_id);
+                            runtime.sink.unregister_fullscreen(window_id);
+                        }
                         drop_pid(&mut runtime, &mut managed, pid);
                     }
                 }
@@ -1385,16 +1470,26 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                 refresh_live_display_state(&mut runtime, &mut display_frames);
                 // Some commands need macOS-layer state/effects the pure core can't
                 // perform; handle those here, otherwise fall through.
-                let response = match try_window_deminimize(
+                let fullscreen_exit = try_window_native_fullscreen_exit(
                     &mut runtime,
                     &mut managed,
-                    &mut minimized_pids,
+                    &mut fullscreen_pids,
                     &tokens,
-                ) {
+                );
+                let was_fullscreen_exit = fullscreen_exit.is_some();
+                let response = match fullscreen_exit {
                     Some(response) => response,
-                    None => match try_space_focus(&mut runtime, &display_frames, &tokens) {
+                    None => match try_window_deminimize(
+                        &mut runtime,
+                        &mut managed,
+                        &mut minimized_pids,
+                        &tokens,
+                    ) {
                         Some(response) => response,
-                        None => runtime.message(&tokens),
+                        None => match try_space_focus(&mut runtime, &display_frames, &tokens) {
+                            Some(response) => response,
+                            None => runtime.message(&tokens),
+                        },
                     },
                 };
                 // A successful `window --focus` updated the pure focus target;
@@ -1426,6 +1521,24 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                         let pid = runtime.state.window_pid(window_id);
                         if runtime.sink.close_window(window_id) {
                             if let Some(pid) = pid {
+                                reconcile_pid(&mut runtime, &mut managed, pid);
+                            }
+                        }
+                    }
+                }
+                // `window --toggle native-fullscreen` (enter half): focus the
+                // window (the AX attribute is only honored on the key window, per
+                // the C daemon), set AXFullscreen, then reconcile so the window —
+                // now on its own fullscreen space — leaves the tiled layout. The
+                // exit half is handled by the intercept above.
+                if !was_fullscreen_exit && response.is_ok() && is_window_native_fullscreen(&tokens)
+                {
+                    if let Some(window_id) = runtime.state.focused_window_id() {
+                        let pid = runtime.state.window_pid(window_id);
+                        runtime.sink.focus_window(window_id);
+                        if runtime.sink.enter_native_fullscreen(window_id) {
+                            if let Some(pid) = pid {
+                                fullscreen_pids.insert(window_id, pid);
                                 reconcile_pid(&mut runtime, &mut managed, pid);
                             }
                         }
@@ -1657,5 +1770,56 @@ mod tests {
         )
         .unwrap();
         assert!(unsupported.unwrap_err().contains("not yet supported"));
+    }
+
+    fn fs_toggle(sel: Option<&str>) -> Vec<String> {
+        let mut tokens = vec!["window".to_string()];
+        if let Some(sel) = sel {
+            tokens.push(sel.to_string());
+        }
+        tokens.push("--toggle".to_string());
+        tokens.push("native-fullscreen".to_string());
+        tokens
+    }
+
+    #[test]
+    fn fullscreen_exit_target_resolves_only_registered_windows() {
+        // Not the native-fullscreen toggle: outer None so the normal path runs.
+        let other = ["window".to_string(), "--toggle".into(), "float".into()];
+        assert_eq!(window_fullscreen_exit_target(&other, &[7]), None);
+
+        // The toggle with no fullscreen windows is an *enter* request: Some(None).
+        assert_eq!(
+            window_fullscreen_exit_target(&fs_toggle(None), &[]),
+            Some(None)
+        );
+        assert_eq!(
+            window_fullscreen_exit_target(&fs_toggle(Some("42")), &[7, 9]),
+            Some(None),
+            "id not in the fullscreen set is an enter request"
+        );
+
+        // Exact id, first, last, and the single-entry bare form all resolve.
+        assert_eq!(
+            window_fullscreen_exit_target(&fs_toggle(Some("9")), &[7, 9]),
+            Some(Some(9))
+        );
+        assert_eq!(
+            window_fullscreen_exit_target(&fs_toggle(Some("first")), &[7, 9]),
+            Some(Some(7))
+        );
+        assert_eq!(
+            window_fullscreen_exit_target(&fs_toggle(Some("last")), &[7, 9]),
+            Some(Some(9))
+        );
+        assert_eq!(
+            window_fullscreen_exit_target(&fs_toggle(None), &[5]),
+            Some(Some(5))
+        );
+        // Ambiguous bare toggle with several fullscreen windows stays an enter.
+        assert_eq!(
+            window_fullscreen_exit_target(&fs_toggle(None), &[5, 6]),
+            Some(None)
+        );
     }
 }

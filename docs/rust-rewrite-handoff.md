@@ -18,8 +18,10 @@ reconstructing context.
   plus live CoreGraphics display discovery, display/space topology reconciliation,
   and AX window diagnostics. Live `window --deminimize` works for numeric,
   `first`, and `last` selectors restored from the daemon's minimized-window AX
-  registry, and `window --close` is wired through the AX close button. 127
-  workspace tests pass. The shipped C `make` flow is unchanged.
+  registry, and `window --close` is wired through the AX close button.
+  `window --toggle native-fullscreen` enters/exits via the `AXFullScreen`
+  attribute with a fullscreen AX registry mirroring minimize. 129 workspace
+  tests pass. The shipped C `make` flow is unchanged.
 - Last updated: 2026-06-25.
 - User decisions captured:
   - The Rust rewrite may diverge permanently from upstream yabai. Rebaseability is no
@@ -30,6 +32,41 @@ reconstructing context.
     forcing literal Rust at the cost of fragile injection behavior.
 
 ## Progress log
+
+### 2026-06-25 (session 8) — native fullscreen
+
+- `window --toggle native-fullscreen` now works in the Rust WM daemon, mirroring
+  `window_manager_toggle_window_native_fullscreen`. `AxSink` gained a `fullscreen`
+  AX-element registry (parallel to the minimized one) plus `enter_native_fullscreen`
+  / `exit_native_fullscreen`, which set the window's `AXFullScreen` attribute
+  (string `"AXFullScreen"`, per `src/window.h`). Entering moves the element into the
+  fullscreen registry so the reconcile that drops the now-untileable window from its
+  tree does not release it; exiting moves it back and reconciles it into the layout.
+- The toggle is split across the two layers like minimize/deminimize:
+  - Enter: the pure core treats `--toggle native-fullscreen` as a validated no-op
+    (`require_focused`); a daemon post-step focuses the window (the attribute is only
+    honored on the key window, per C), sets `AXFullScreen`, records the pid, and
+    reconciles so the window leaves the tiled layout for its own fullscreen space.
+  - Exit: a fullscreen window has left every tree, so the pure core cannot act on
+    it. `try_window_native_fullscreen_exit` intercepts the toggle, resolves the
+    target against the fullscreen registry (numeric id / `first` / `last` / a bare
+    toggle when exactly one window is fullscreen), clears `AXFullScreen`, and
+    reconciles. A `was_fullscreen_exit` flag stops the enter post-step from
+    re-firing on the same tokens. App termination drops any fullscreen-registry
+    entries for that pid (like minimized).
+- Deferred (need live state the pure/registry layers don't have): `next`/`prev`/
+  direction/`recent`/`mouse`/label selectors for the exit half, and a bare-toggle
+  exit when several windows are fullscreen (kept as an enter to stay unambiguous).
+- Live remote verification on macOS 26.2: WM daemon on isolated socket
+  `/tmp/yabai_rtest.socket` over Finder (10 windows, 2 displays). `window 780
+  --focus` then `window --toggle native-fullscreen` removed id 780 from
+  `query --windows` (10 → 9) and a `-D 1` screenshot showed a single Finder window
+  filling the whole display with no menu bar or tiled siblings. `window 780
+  --toggle native-fullscreen` returned 780 to the tiled query; toggling again
+  re-entered fullscreen (correct toggle semantics), and a final toggle restored all
+  10 windows.
+- Verification: `cargo fmt --all`; `cargo test --workspace` (129 tests);
+  `cargo clippy --workspace --all-targets`; `cargo build --release -p yabai`.
 
 ### 2026-06-25 (session 7) — window close
 
@@ -1128,8 +1165,8 @@ own usable frame), tiles each display's current space simultaneously, and routes
 discovered windows to the display/space they're physically on. Active-space
 changes are notified through NSWorkspace; app launch/termination are notified
 too; space add/remove is refreshed by polling before daemon work. Window ops:
-focus (raise), close, swap, warp, minimize/deminimize, toggle float/zoom; space
-focus (gesture) and rotate/balance/mirror/layout.
+focus (raise), close, swap, warp, minimize/deminimize, toggle
+float/zoom/native-fullscreen; space focus (gesture) and rotate/balance/mirror/layout.
 
 ### Do these next, in order (Phase 5/6 breadth — the big remaining work)
 
@@ -1150,11 +1187,13 @@ focus (gesture) and rotate/balance/mirror/layout.
    tick remains a backstop for missed AX/window changes and CGWindowList pickup.
 4. More window ops needing live state: done — `window --focus` with-raise
    (`AxSink::focus_window`), `--close`, `--warp`, `--toggle float`, `--toggle
-   zoom-fullscreen`/`zoom-parent`, `--minimize`, `--deminimize` for numeric ids
-   and `first`/`last`; `--swap` already worked. Still to do: remaining
-   deminimize selectors, focus without-raise, native fullscreen,
-   sticky/scratchpad, opacity/layer; mouse drag move/resize/swap; rules + signals
-   execution.
+   zoom-fullscreen`/`zoom-parent`, `--toggle native-fullscreen` (enter on the
+   focused window; exit via id/`first`/`last`/single-window bare toggle),
+   `--minimize`, `--deminimize` for numeric ids and `first`/`last`; `--swap`
+   already worked. Still to do: remaining deminimize/native-fullscreen-exit
+   selectors, focus without-raise, sticky/scratchpad, opacity/layer (opacity needs
+   the scripting addition — `scripting_addition_set_opacity`); mouse drag
+   move/resize/swap; rules + signals execution.
 5. Then Phases 7-9: scripting addition (`yabai-sa`, currently empty — required
    for space management / cross-space moves on modern macOS), OSAX spike, and
    production packaging (wire the Rust binary into `make`, signing, notarization,

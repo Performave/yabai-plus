@@ -1015,6 +1015,7 @@ fn ax_pid(element: CFTypeRef) -> Option<i32> {
 pub struct AxSink {
     windows: HashMap<u32, AxWindow>,
     minimized: HashMap<u32, AxWindow>,
+    fullscreen: HashMap<u32, AxWindow>,
     position_attr: CFStringRef,
     size_attr: CFStringRef,
 }
@@ -1039,6 +1040,7 @@ impl AxSink {
         Self {
             windows: HashMap::new(),
             minimized: HashMap::new(),
+            fullscreen: HashMap::new(),
             position_attr,
             size_attr,
         }
@@ -1047,6 +1049,7 @@ impl AxSink {
     /// Register a window's accessibility element so frames can be applied to it.
     pub fn register(&mut self, window_id: u32, window: AxWindow) {
         self.minimized.remove(&window_id);
+        self.fullscreen.remove(&window_id);
         self.windows.insert(window_id, window);
     }
 
@@ -1072,6 +1075,57 @@ impl AxSink {
         let mut ids = self.minimized.keys().copied().collect::<Vec<_>>();
         ids.sort_unstable();
         ids
+    }
+
+    pub fn is_fullscreen_registered(&self, window_id: u32) -> bool {
+        self.fullscreen.contains_key(&window_id)
+    }
+
+    pub fn fullscreen_window_ids(&self) -> Vec<u32> {
+        let mut ids = self.fullscreen.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Forget a native-fullscreen window, releasing its held element.
+    pub fn unregister_fullscreen(&mut self, window_id: u32) {
+        self.fullscreen.remove(&window_id);
+    }
+
+    /// Put a managed window into native fullscreen by setting its
+    /// `AXFullscreen` attribute, like `window_manager_toggle_window_native_fullscreen`.
+    /// On success the element is moved into the fullscreen registry so the next
+    /// reconcile (which drops the now-untileable window from its tree) does not
+    /// release it — it is needed to toggle fullscreen back off later. Returns
+    /// `false` if the window is not an active managed window.
+    pub fn enter_native_fullscreen(&mut self, window_id: u32) -> bool {
+        let Some(window) = self.windows.remove(&window_id) else {
+            return false;
+        };
+        if set_ax_fullscreen(window.element, true) {
+            self.fullscreen.insert(window_id, window);
+            true
+        } else {
+            self.windows.insert(window_id, window);
+            false
+        }
+    }
+
+    /// Take a window out of native fullscreen by clearing its `AXFullscreen`
+    /// attribute. The element returns to the active registry; the following
+    /// reconcile re-tiles the window. Returns `false` if the window is not in the
+    /// fullscreen registry or the attribute could not be cleared.
+    pub fn exit_native_fullscreen(&mut self, window_id: u32) -> bool {
+        let Some(window) = self.fullscreen.remove(&window_id) else {
+            return false;
+        };
+        if set_ax_fullscreen(window.element, false) {
+            self.windows.insert(window_id, window);
+            true
+        } else {
+            self.fullscreen.insert(window_id, window);
+            false
+        }
     }
 
     /// Focus a managed window: bring its app to the front with this window key,
@@ -1173,6 +1227,27 @@ fn set_ax_minimized(element: AXUIElementRef, minimized: bool) -> bool {
             return false;
         }
         let value = if minimized {
+            kCFBooleanTrue
+        } else {
+            kCFBooleanFalse
+        };
+        let err = AXUIElementSetAttributeValue(element, attr, value);
+        CFRelease(attr);
+        err == 0
+    }
+}
+
+fn set_ax_fullscreen(element: AXUIElementRef, fullscreen: bool) -> bool {
+    // SAFETY: `element` is a retained AX window element owned by the sink;
+    // `kCFBoolean*` are immortal CoreFoundation singletons. A fresh CFString
+    // attribute name is created and released around the set. Mirrors
+    // `window_manager_toggle_window_native_fullscreen` (kAXFullscreenAttribute).
+    unsafe {
+        let attr = cfstring(b"AXFullScreen\0");
+        if attr.is_null() {
+            return false;
+        }
+        let value = if fullscreen {
             kCFBooleanTrue
         } else {
             kCFBooleanFalse
