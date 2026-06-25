@@ -22,11 +22,11 @@ reconstructing context.
   `window --toggle native-fullscreen` enters/exits via the `AXFullScreen`
   attribute with a fullscreen AX registry mirroring minimize. The `signal` domain
   is modeled and executed: `signal --add/--list/--remove` plus live firing of
-  `window_created`, `window_destroyed`, `window_focused`,
-  `application_launched/terminated`, and `space_changed` actions, with
-  `app`/`title` regex filters now honored for the event categories that carry
-  that metadata. `mouse_follows_focus` warps the cursor to the focused window on
-  focus.
+  `window_created`, `window_destroyed`, `window_focused`, `window_minimized`,
+  `window_deminimized`, `application_launched/terminated`, and `space_changed`
+  actions, with `app`/`title` regex filters now honored for the event categories
+  that carry that metadata. `mouse_follows_focus` warps the cursor to the focused
+  window on focus.
   The `rule` domain is modeled and executed for stored rules, list/remove/apply,
   one-shot removal, regex matching, and the live `manage` effect (`manage=off`
   floats/untiles, `manage=on` retiles); other rule effects are parsed/stored but
@@ -41,6 +41,28 @@ reconstructing context.
     forcing literal Rust at the cost of fragile injection behavior.
 
 ## Progress log
+
+### 2026-06-25 (session 14) — minimize/deminimize signals
+
+- The Rust WM daemon now fires live `window_minimized` and `window_deminimized`
+  signals when the corresponding command paths succeed. `window --minimize`
+  caches the acting window's metadata before reconcile removes it from the tiled
+  tree, then fires `SIGNAL_WINDOW_MINIMIZED` with `YABAI_WINDOW_ID`, app/title,
+  and active context. `window <sel> --deminimize` fires after restoring the AX
+  element and reconciling the app, using refreshed runtime metadata or the
+  lifecycle signal registry as fallback context.
+- Added a pure runtime regression in `signal_filters_match_c_event_categories` so
+  `window_minimized` honors `active=yes|no` while `window_deminimized` follows the
+  C category that filters by app/title only.
+- Live remote verification on `ssh student@student` with the WM daemon on socket
+  `/tmp/yabai_minsig.socket`: registered Finder-filtered minimize/deminimize
+  signals, focused Finder window `1040`, ran `window --minimize` and confirmed it
+  disappeared from `query --windows`, then ran `window 1040 --deminimize` and
+  confirmed it returned. `/tmp/minsig.log` contained exactly `min:1040` and
+  `demin:1040`. The test daemon and temp files were cleaned up, and the test
+  Finder window was closed.
+- Verification: `cargo fmt --all`; `cargo test --workspace` (145 tests);
+  `cargo clippy --workspace --all-targets`; `cargo build --release -p yabai`.
 
 ### 2026-06-25 (session 13) — window lifecycle signals
 
@@ -1344,9 +1366,9 @@ changes are notified through NSWorkspace; app launch/termination are notified
 too; space add/remove is refreshed by polling before daemon work. Window ops:
 focus (raise), close, swap, warp, minimize/deminimize, toggle
 float/zoom/native-fullscreen; space focus (gesture) and rotate/balance/mirror/layout;
-`signal` add/list/remove with live firing on focus/app/space events and app/title
-filters for focused-window/application events; `mouse_follows_focus` cursor
-centering on focus.
+`signal` add/list/remove with live firing on focus/app/space/minimize/deminimize
+events and app/title filters for focused-window/application events;
+`mouse_follows_focus` cursor centering on focus.
 
 ### Do these next, in order (Phase 5/6 breadth — the big remaining work)
 
@@ -1379,9 +1401,10 @@ centering on focus.
    Signals: mostly done — `signal --add/--list/--remove`, app/title regex filters
    (including `!=` exclusion), and live firing of `window_created`,
    `window_destroyed`, `window_focused`, `application_launched/terminated`,
-   `space_changed` (with `YABAI_*` env vars). Still to do: remaining signal event
-   categories (`window_moved/resized/minimized/deminimized/title_changed`,
-   application activated/deactivated/hidden/visible/front-switched, space/display/
+   `space_changed`, `window_minimized`, and `window_deminimized` (with `YABAI_*`
+   env vars). Still to do: remaining signal event categories
+   (`window_moved/resized/title_changed`, application
+   activated/deactivated/hidden/visible/front-switched, space/display/
    Mission Control/system events) and more live verification of app-filtered
    launch/terminate events from a GUI-launched daemon session.
 5. Then Phases 7-9: scripting addition (`yabai-sa`, currently empty — required
@@ -1401,7 +1424,7 @@ centering on focus.
   block needs a `// SAFETY:` comment. `cargo fmt` reorders `use` lists
   (types/fns interleaved alphabetically); let it, then match its output.
 - Verify each step with `cargo fmt --all && cargo clippy --workspace
-  --all-targets && cargo test --workspace`. Currently 127 tests, clippy clean.
+  --all-targets && cargo test --workspace`. Currently 145 tests, clippy clean.
 - The live WM daemon binds only a caller-supplied socket; to message it use a
   socket named `/tmp/yabai_<name>.socket` and query with `USER=<name>`. Always
   `pkill -f experimental-rust-wm-daemon` to stop it (each shell call is a fresh

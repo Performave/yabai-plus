@@ -2653,6 +2653,28 @@ mod tests {
                 "action=echo app",
             ]))
             .unwrap();
+        state
+            .handle_tokens(&toks(&[
+                "signal",
+                "--add",
+                "event=window_minimized",
+                "app=^Finder$",
+                "title=Downloads",
+                "active=yes",
+                "action=echo min",
+            ]))
+            .unwrap();
+        state
+            .handle_tokens(&toks(&[
+                "signal",
+                "--add",
+                "event=window_deminimized",
+                "app=^Finder$",
+                "title=Downloads",
+                "active=yes",
+                "action=echo demin",
+            ]))
+            .unwrap();
 
         assert_eq!(
             state.signal_actions_for_context(
@@ -2681,6 +2703,34 @@ mod tests {
                 None,
             ),
             vec!["echo app".to_string()]
+        );
+        assert_eq!(
+            state.signal_actions_for_context(
+                SignalEvent::WindowMinimized,
+                Some("Finder"),
+                Some("Downloads"),
+                Some(true),
+            ),
+            vec!["echo min".to_string()]
+        );
+        assert!(
+            state
+                .signal_actions_for_context(
+                    SignalEvent::WindowMinimized,
+                    Some("Finder"),
+                    Some("Downloads"),
+                    Some(false),
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            state.signal_actions_for_context(
+                SignalEvent::WindowDeminimized,
+                Some("Finder"),
+                Some("Downloads"),
+                Some(false),
+            ),
+            vec!["echo demin".to_string()]
         );
         assert!(
             state

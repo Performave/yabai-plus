@@ -963,6 +963,19 @@ fn try_window_deminimize(
     }
 
     reconcile_pid(runtime, managed, signaled, pid);
+    let meta = runtime.state.window_meta(window_id).or_else(|| {
+        signaled
+            .get(&pid)
+            .and_then(|windows| windows.get(&window_id))
+    });
+    fire_signals(
+        runtime,
+        SignalEvent::WindowDeminimized,
+        &[("YABAI_WINDOW_ID", window_id.to_string())],
+        meta.map(|m| m.app.as_str()),
+        meta.map(|m| m.title.as_str()),
+        None,
+    );
     Some(Ok(None))
 }
 
@@ -1740,11 +1753,21 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                 if response.is_ok() && is_window_minimize(&tokens) {
                     if let Some(window_id) = runtime.state.focused_window_id() {
                         let pid = runtime.state.window_pid(window_id);
+                        let active = runtime.state.focused_window_id() == Some(window_id);
+                        let meta = runtime.state.window_meta(window_id).cloned();
                         if runtime.sink.set_minimized(window_id, true) {
                             if let Some(pid) = pid {
                                 minimized_pids.insert(window_id, pid);
                                 reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
                             }
+                            fire_signals(
+                                &runtime,
+                                SignalEvent::WindowMinimized,
+                                &[("YABAI_WINDOW_ID", window_id.to_string())],
+                                meta.as_ref().map(|m| m.app.as_str()),
+                                meta.as_ref().map(|m| m.title.as_str()),
+                                Some(active),
+                            );
                         }
                     }
                 }
