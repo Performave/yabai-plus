@@ -18,7 +18,8 @@ reconstructing context.
   plus live CoreGraphics display discovery, display/space topology reconciliation,
   and AX window diagnostics. Live `window --deminimize` works for numeric,
   `first`, and `last` selectors restored from the daemon's minimized-window AX
-  registry. 123 workspace tests pass. The shipped C `make` flow is unchanged.
+  registry, and `window --close` is wired through the AX close button. 127
+  workspace tests pass. The shipped C `make` flow is unchanged.
 - Last updated: 2026-06-25.
 - User decisions captured:
   - The Rust rewrite may diverge permanently from upstream yabai. Rebaseability is no
@@ -29,6 +30,22 @@ reconstructing context.
     forcing literal Rust at the cost of fragile injection behavior.
 
 ## Progress log
+
+### 2026-06-25 (session 7) — window close
+
+- `window --close` is now wired in the Rust WM daemon. `AppState` treats close as
+  a validated no-op, like minimize, and the daemon then calls the new
+  `AxSink::close_window`, which presses the window's `AXCloseButton` via
+  `AXPress`, matching `window_manager_close_window` in the C daemon. After a
+  successful close press the daemon reconciles the app immediately; the existing
+  3s tick remains the backstop for delayed AX destroy notifications.
+- Fixed a command-routing gap found while adding close: the pure runtime now
+  applies a leading `window <selector>` as the acting window before dispatching
+  actions. This makes `window 1 --close`, `window 1 --minimize`, and
+  `window 1 --focus` target the selected window instead of ignoring the leading
+  selector.
+- Verification: `cargo fmt --all`; `cargo test --workspace` (127 tests);
+  `cargo clippy --workspace --all-targets`.
 
 ### 2026-06-25 (session 4) — display hot-plug
 
@@ -1111,8 +1128,8 @@ own usable frame), tiles each display's current space simultaneously, and routes
 discovered windows to the display/space they're physically on. Active-space
 changes are notified through NSWorkspace; app launch/termination are notified
 too; space add/remove is refreshed by polling before daemon work. Window ops:
-focus (raise), swap, warp, minimize/deminimize, toggle float/zoom; space focus
-(gesture) and rotate/balance/mirror/layout.
+focus (raise), close, swap, warp, minimize/deminimize, toggle float/zoom; space
+focus (gesture) and rotate/balance/mirror/layout.
 
 ### Do these next, in order (Phase 5/6 breadth — the big remaining work)
 
@@ -1132,7 +1149,7 @@ focus (raise), swap, warp, minimize/deminimize, toggle float/zoom; space focus
 3. App launch/termination are now observed directly through NSWorkspace; the 3s
    tick remains a backstop for missed AX/window changes and CGWindowList pickup.
 4. More window ops needing live state: done — `window --focus` with-raise
-   (`AxSink::focus_window`), `--warp`, `--toggle float`, `--toggle
+   (`AxSink::focus_window`), `--close`, `--warp`, `--toggle float`, `--toggle
    zoom-fullscreen`/`zoom-parent`, `--minimize`, `--deminimize` for numeric ids
    and `first`/`last`; `--swap` already worked. Still to do: remaining
    deminimize selectors, focus without-raise, native fullscreen,
@@ -1155,7 +1172,7 @@ focus (raise), swap, warp, minimize/deminimize, toggle float/zoom; space focus
   block needs a `// SAFETY:` comment. `cargo fmt` reorders `use` lists
   (types/fns interleaved alphabetically); let it, then match its output.
 - Verify each step with `cargo fmt --all && cargo clippy --workspace
-  --all-targets && cargo test --workspace`. Currently 123 tests, clippy clean.
+  --all-targets && cargo test --workspace`. Currently 127 tests, clippy clean.
 - The live WM daemon binds only a caller-supplied socket; to message it use a
   socket named `/tmp/yabai_<name>.socket` and query with `USER=<name>`. Always
   `pkill -f experimental-rust-wm-daemon` to stop it (each shell call is a fresh

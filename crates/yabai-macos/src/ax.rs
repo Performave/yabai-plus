@@ -1106,6 +1106,31 @@ impl AxSink {
         true
     }
 
+    /// Close a managed window by pressing its `AXCloseButton`, matching
+    /// `window_manager_close_window` in the C daemon.
+    pub fn close_window(&self, window_id: u32) -> bool {
+        let Some(window) = self.windows.get(&window_id) else {
+            return false;
+        };
+        let button = AX_CLOSE_BUTTON_ATTR.with(|attr| {
+            if attr.is_null() {
+                std::ptr::null()
+            } else {
+                copy_attribute(window.element, *attr)
+            }
+        });
+        if button.is_null() {
+            return false;
+        }
+        // SAFETY: `button` is an owned AX element returned by CopyAttributeValue;
+        // the press action string is a thread-local CFString valid for this call.
+        unsafe {
+            let err = AX_PRESS_ACTION.with(|action| AXUIElementPerformAction(button, *action));
+            CFRelease(button);
+            err == 0
+        }
+    }
+
     /// Minimize or de-minimize a managed window by toggling its
     /// `AXMinimized` attribute, like `window_manager_{minimize,deminimize}_window`.
     /// Returns `false` if the window is not registered. A minimized window is no
@@ -1165,6 +1190,18 @@ thread_local! {
         // SAFETY: the literal is NUL-terminated; the CFString lives for the
         // thread's lifetime (never released), matching the C constant.
         unsafe { cfstring(b"AXRaise\0") }
+    };
+    /// `kAXPressAction` ("AXPress") as an owned CFString, created once per thread.
+    static AX_PRESS_ACTION: CFStringRef = {
+        // SAFETY: the literal is NUL-terminated; the CFString lives for the
+        // thread's lifetime (never released), matching the C constant.
+        unsafe { cfstring(b"AXPress\0") }
+    };
+    /// `kAXCloseButtonAttribute` ("AXCloseButton") as an owned CFString.
+    static AX_CLOSE_BUTTON_ATTR: CFStringRef = {
+        // SAFETY: the literal is NUL-terminated; the CFString lives for the
+        // thread's lifetime (never released), matching the C constant.
+        unsafe { cfstring(b"AXCloseButton\0") }
     };
 }
 
@@ -1245,6 +1282,12 @@ mod tests {
         assert!(sink.is_registered(3));
         sink.unregister(3);
         assert!(!sink.is_registered(3));
+    }
+
+    #[test]
+    fn close_unregistered_window_returns_false() {
+        let sink = AxSink::new();
+        assert!(!sink.close_window(7));
     }
 
     #[test]

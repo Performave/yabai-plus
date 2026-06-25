@@ -857,6 +857,15 @@ fn is_window_minimize(tokens: &[String]) -> bool {
     )
 }
 
+/// True if `tokens` is a `window --close` command.
+fn is_window_close(tokens: &[String]) -> bool {
+    matches!(
+        parse_message(tokens),
+        Ok(Message::Window(cmd))
+            if cmd.actions.iter().any(|action| matches!(action, WindowAction::Close))
+    )
+}
+
 /// Extract the target from a standalone `window <sel> --deminimize`. Minimized
 /// windows are no longer in the layout tree, so only numeric ids and registry
 /// order selectors are resolved here.
@@ -1409,6 +1418,19 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                         }
                     }
                 }
+                // `window --close`: press the AX close button for the acting
+                // window. AX destroy is unreliable, so reconcile immediately and
+                // let the 3s tick catch any delayed close.
+                if response.is_ok() && is_window_close(&tokens) {
+                    if let Some(window_id) = runtime.state.focused_window_id() {
+                        let pid = runtime.state.window_pid(window_id);
+                        if runtime.sink.close_window(window_id) {
+                            if let Some(pid) = pid {
+                                reconcile_pid(&mut runtime, &mut managed, pid);
+                            }
+                        }
+                    }
+                }
                 let _ = reply.send(response);
             }
         }
@@ -1506,6 +1528,10 @@ mod tests {
     use std::thread;
     use yabai_ipc::encode_client_message;
 
+    fn toks(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn experimental_daemon_serves_one_message() {
         let dir = std::env::temp_dir();
@@ -1582,6 +1608,13 @@ mod tests {
         assert!(resolve_space_target(&spaces, Some(20), &Selector::Recent).is_err());
         assert!(resolve_space_target(&spaces, Some(20), &Selector::Mouse).is_err());
         assert!(resolve_space_target(&spaces, None, &Selector::Next).is_err());
+    }
+
+    #[test]
+    fn detects_window_close_messages() {
+        assert!(is_window_close(&toks(&["window", "--close"])));
+        assert!(is_window_close(&toks(&["window", "42", "--close"])));
+        assert!(!is_window_close(&toks(&["window", "--minimize"])));
     }
 
     #[test]

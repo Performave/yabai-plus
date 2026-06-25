@@ -434,7 +434,7 @@ impl AppState {
     pub fn dispatch(&mut self, message: Message) -> Response {
         match message {
             Message::Config(cmd) => self.dispatch_config(&cmd.ops),
-            Message::Window(cmd) => self.dispatch_window(&cmd.actions),
+            Message::Window(cmd) => self.dispatch_window(cmd.target.as_ref(), &cmd.actions),
             Message::Space(cmd) => self.dispatch_space(&cmd.actions),
             Message::Query(cmd) => self.dispatch_query(&cmd),
             // Domains whose effects need the macOS layers are accepted but not
@@ -468,7 +468,10 @@ impl AppState {
         Ok((!output.is_empty()).then_some(output))
     }
 
-    fn dispatch_window(&mut self, actions: &[WindowAction]) -> Response {
+    fn dispatch_window(&mut self, target: Option<&Selector>, actions: &[WindowAction]) -> Response {
+        if let Some(target) = target {
+            self.focused_window = Some(self.resolve_window(target)?);
+        }
         for action in actions {
             match action {
                 WindowAction::Focus(sel) => {
@@ -489,6 +492,11 @@ impl AppState {
                 WindowAction::Minimize => {
                     // Validate a window is focused; the macOS layer (daemon) sets
                     // AXMinimized and reconcile drops it from the tree.
+                    self.require_focused()?;
+                }
+                WindowAction::Close => {
+                    // Validate a window is focused; the macOS layer (daemon)
+                    // presses the AX close button and later reconciliation drops it.
                     self.require_focused()?;
                 }
                 WindowAction::Toggle(name) => match name.as_str() {
@@ -1147,6 +1155,45 @@ mod tests {
                 .handle_tokens(&toks(&["window", "--minimize"]))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn close_requires_a_focused_or_selected_window() {
+        let mut state = state_with_space();
+        state.add_window(1).unwrap();
+        state.add_window(2).unwrap();
+        state.set_focused_window(None);
+
+        assert_eq!(
+            state.handle_tokens(&toks(&["window", "--close"])),
+            Err("no focused window".to_string())
+        );
+
+        assert_eq!(
+            state.handle_tokens(&toks(&["window", "1", "--close"])),
+            Ok(None)
+        );
+        assert_eq!(state.focused_window, Some(1));
+    }
+
+    #[test]
+    fn leading_window_selector_sets_the_acting_window() {
+        let mut state = state_with_space();
+        state.add_window(1).unwrap();
+        state.add_window(2).unwrap();
+        state.set_focused_window(Some(2));
+
+        assert_eq!(
+            state.handle_tokens(&toks(&["window", "1", "--minimize"])),
+            Ok(None)
+        );
+        assert_eq!(state.focused_window, Some(1));
+
+        assert_eq!(
+            state.handle_tokens(&toks(&["window", "2", "--focus"])),
+            Ok(None)
+        );
+        assert_eq!(state.focused_window, Some(2));
     }
 
     #[test]
