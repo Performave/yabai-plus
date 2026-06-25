@@ -30,6 +30,16 @@ reconstructing context.
 
 ### 2026-06-25 (session 2)
 
+- `window --toggle float`: new `AppState.floating: HashSet<u32>`. Floating drops
+  the window from its tree (others re-tile) and keeps it focused and put;
+  unfloating re-tiles it into the active space. The key correctness piece is that
+  `assign_window_to_space` no-ops for floating windows, so the daemon's
+  reconcile/tick never re-adds them; `remove_window` clears the mark on destroy.
+  Floating windows are absent from the tree and thus from `query --windows`
+  (a deliberate simplification — the C daemon tracks them separately). Verified
+  live: floating a window pulled it from the tree, re-tiled the rest, and it
+  stayed floating across a reconcile tick; unfloating restored a clean 3-window
+  BSP tile. 119 workspace tests, clippy clean.
 - `window --toggle zoom-fullscreen` / `zoom-parent`: new `Tree::toggle_zoom` +
   `ZoomKind`. Zoom is a capture-time frame override (the window keeps its tree
   slot; `capture()` returns the root area for fullscreen, the parent-node area for
@@ -994,10 +1004,11 @@ Single-display, active-space tiling only.
    per-display spaces and route windows to the display they're on.
 3. App launch/termination are now observed directly through NSWorkspace; the 3s
    tick remains a backstop for missed AX/window changes and CGWindowList pickup.
-4. More window ops needing live state: `window --focus` with-raise now works
-   (`AxSink::focus_window`); still to do: focus without-raise, minimize/
-   fullscreen/sticky/scratchpad, opacity/layer; mouse drag move/resize/swap;
-   rules + signals execution.
+4. More window ops needing live state: done — `window --focus` with-raise
+   (`AxSink::focus_window`), `--warp`, `--toggle float`, `--toggle
+   zoom-fullscreen`/`zoom-parent`; `--swap` already worked. Still to do: focus
+   without-raise, minimize/deminimize, native fullscreen, sticky/scratchpad,
+   opacity/layer; mouse drag move/resize/swap; rules + signals execution.
 5. Then Phases 7-9: scripting addition (`yabai-sa`, currently empty — required
    for space management / cross-space moves on modern macOS), OSAX spike, and
    production packaging (wire the Rust binary into `make`, signing, notarization,

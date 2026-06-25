@@ -11,7 +11,7 @@
 //! live state the tree does not hold (`recent`, `mouse`, `stack[.N]`, labels)
 //! return an explicit error rather than silently guessing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use yabai_core::{
     Area, ConfigOp, Message, NodeSplit, QueryCommand, QueryScopeKind, QueryTarget, Selector,
@@ -99,6 +99,9 @@ pub struct AppState {
     active_space: Option<u64>,
     focused_window: Option<u32>,
     window_meta: HashMap<u32, WindowMeta>,
+    /// Windows the user floated (`window --toggle float`): kept out of every tree
+    /// so they are never tiled, and skipped by reconcile's space assignment.
+    floating: HashSet<u32>,
 }
 
 /// Lightweight per-window metadata the macOS layer supplies for queries
@@ -213,6 +216,11 @@ impl AppState {
 
     /// Assign a window to `sid`, removing it from any previous tree first.
     pub fn assign_window_to_space(&mut self, window_id: u32, sid: u64) -> Result<(), String> {
+        // Floating windows are never tiled; this no-op is what keeps reconcile
+        // from re-adding them to a tree on every tick.
+        if self.floating.contains(&window_id) {
+            return Ok(());
+        }
         let previous_sid = self.window_space(window_id);
         if previous_sid == Some(sid) {
             return Ok(());
@@ -240,8 +248,10 @@ impl AppState {
         Ok(())
     }
 
-    /// Remove a window from whichever space currently owns it.
+    /// Remove a window from whichever space currently owns it (e.g. on destroy),
+    /// also clearing any floating mark.
     pub fn remove_window(&mut self, window_id: u32) -> Result<(), String> {
+        self.floating.remove(&window_id);
         for tree in self.spaces.values_mut() {
             tree.remove_window(window_id);
         }
@@ -249,6 +259,11 @@ impl AppState {
             self.focused_window = None;
         }
         Ok(())
+    }
+
+    /// Whether `window_id` is currently floating (untiled).
+    pub fn is_floating(&self, window_id: u32) -> bool {
+        self.floating.contains(&window_id)
     }
 
     /// Set a space's usable frame from its full display frame, insetting by the
@@ -407,17 +422,38 @@ impl AppState {
                     let focused = self.require_focused()?;
                     self.active_tree_mut()?.warp_window(focused, target);
                 }
-                WindowAction::Toggle(name) => {
-                    let kind = match name.as_str() {
-                        "zoom-fullscreen" => ZoomKind::Fullscreen,
-                        "zoom-parent" => ZoomKind::Parent,
-                        // Other toggles (float/sticky/split/shadow) need state the
-                        // pure layer / macOS layers don't model yet.
-                        _ => return Err(format!("window toggle '{name}' not yet handled")),
-                    };
-                    let focused = self.require_focused()?;
-                    self.active_tree_mut()?.toggle_zoom(focused, kind);
-                }
+                WindowAction::Toggle(name) => match name.as_str() {
+                    "zoom-fullscreen" => {
+                        let focused = self.require_focused()?;
+                        self.active_tree_mut()?
+                            .toggle_zoom(focused, ZoomKind::Fullscreen);
+                    }
+                    "zoom-parent" => {
+                        let focused = self.require_focused()?;
+                        self.active_tree_mut()?
+                            .toggle_zoom(focused, ZoomKind::Parent);
+                    }
+                    "float" => {
+                        let focused = self.require_focused()?;
+                        if self.floating.remove(&focused) {
+                            // Un-float: tile it back into the active space.
+                            let sid = self
+                                .active_space
+                                .ok_or_else(|| "no active space".to_string())?;
+                            self.assign_window_to_space(focused, sid)?;
+                        } else {
+                            // Float: drop it from its tree (others re-tile) but keep
+                            // it focused and where it is — never moved again.
+                            self.floating.insert(focused);
+                            for tree in self.spaces.values_mut() {
+                                tree.remove_window(focused);
+                            }
+                        }
+                    }
+                    // Other toggles (sticky/split/shadow) need state the pure /
+                    // macOS layers don't model yet.
+                    _ => return Err(format!("window toggle '{name}' not yet handled")),
+                },
                 WindowAction::Resize { handle, dw, dh } => {
                     let focused = self.require_focused()?;
                     self.active_tree_mut()?
@@ -991,6 +1027,51 @@ mod tests {
         state.add_space_to_display(1, 42, Area::new(0.0, 0.0, 1440.0, 900.0));
         state.add_space_to_display(2, 77, Area::new(1440.0, 0.0, 1280.0, 720.0));
         state
+    }
+
+    #[test]
+    fn toggle_float_untiles_then_retiles() {
+        let mut state = state_with_space();
+        state.add_window(1).unwrap();
+        state.add_window(2).unwrap();
+        state.set_focused_window(Some(1));
+
+        // Float 1: it leaves the tree, 2 fills the space, 1 is not captured.
+        assert_eq!(
+            state.handle_tokens(&toks(&["window", "--toggle", "float"])),
+            Ok(None)
+        );
+        assert!(state.is_floating(1));
+        assert_eq!(state.space(1).unwrap().window_list(), vec![2]);
+        assert!(state.flush(1).unwrap().iter().all(|f| f.window_id != 1));
+
+        // A reconcile re-assignment must stay a no-op while floating.
+        state.assign_window_to_space(1, 1).unwrap();
+        assert_eq!(state.space(1).unwrap().window_list(), vec![2]);
+
+        // Toggle off: 1 tiles back in.
+        assert_eq!(
+            state.handle_tokens(&toks(&["window", "--toggle", "float"])),
+            Ok(None)
+        );
+        assert!(!state.is_floating(1));
+        let mut list = state.space(1).unwrap().window_list();
+        list.sort_unstable();
+        assert_eq!(list, vec![1, 2]);
+    }
+
+    #[test]
+    fn destroying_a_floating_window_clears_the_mark() {
+        let mut state = state_with_space();
+        state.add_window(1).unwrap();
+        state.add_window(2).unwrap();
+        state.set_focused_window(Some(1));
+        state
+            .handle_tokens(&toks(&["window", "--toggle", "float"]))
+            .unwrap();
+        assert!(state.is_floating(1));
+        state.remove_window(1).unwrap();
+        assert!(!state.is_floating(1));
     }
 
     #[test]
