@@ -6,15 +6,16 @@ use std::sync::mpsc::{Sender, SyncSender, channel, sync_channel};
 use std::thread;
 use std::time::Duration;
 
-use yabai_core::Area;
+use yabai_core::{Area, Message, Selector, SpaceAction, parse_message};
 use yabai_ipc::{FAILURE_MARKER, daemon_socket_path, decode_client_payload, send_message};
 use yabai_macos::ax::DiscoveredAxWindow;
 use yabai_macos::{
     AxSink, ObservedEvent, WorkspaceEvent, accessibility_trusted_with_prompt, active_displays,
     application_pids_with_windows, current_space_for_display, focused_window,
-    focused_window_diagnostics, main_visible_frame, move_focused_window, move_pid_window,
-    observe_pid, observe_workspace, regular_application_pids, spaces_for_display,
-    spaces_for_window, tileable_pid_windows, windows_for_pid, windows_for_pid_diagnostics,
+    focused_window_diagnostics, main_visible_frame, mission_control_spaces, move_focused_window,
+    move_pid_window, observe_pid, observe_workspace, regular_application_pids, spaces_for_display,
+    spaces_for_window, switch_space_by_gesture, tileable_pid_windows, windows_for_pid,
+    windows_for_pid_diagnostics,
 };
 use yabai_runtime::{
     Actor, AppState, LayoutSink, RecordingSink, Response, Runtime, StateEvent, WindowMeta,
@@ -633,6 +634,93 @@ fn refresh_active_space(runtime: &mut Runtime<AxSink>, display_id: u32) {
     runtime.state.flush_active_to(&mut runtime.sink);
 }
 
+/// Intercept a standalone `space --focus <selector>` and enact the active-space
+/// switch through the macOS layer, returning `Some(response)`. Any other message
+/// (including a `--focus` mixed with other actions) returns `None` so the caller
+/// dispatches it through the pure core. Mirrors `space_manager_focus_space`'s
+/// gesture fallback; the scripting-addition path is deferred (Phase 8).
+fn try_space_focus(
+    runtime: &mut Runtime<AxSink>,
+    display_id: u32,
+    tokens: &[String],
+) -> Option<Response> {
+    let Ok(Message::Space(cmd)) = parse_message(tokens) else {
+        return None;
+    };
+    let [SpaceAction::Focus(Some(selector))] = cmd.actions.as_slice() else {
+        return None;
+    };
+
+    let spaces = match mission_control_spaces() {
+        Ok(spaces) if !spaces.is_empty() => spaces,
+        _ => return Some(Err("could not enumerate spaces.".to_string())),
+    };
+    let active = runtime
+        .state
+        .active_space_id()
+        .or_else(|| current_space_for_display(display_id).ok());
+
+    let target = match resolve_space_target(&spaces, active, selector) {
+        Ok(target) => target,
+        Err(error) => return Some(Err(error)),
+    };
+    if Some(target) == active {
+        return Some(Err("cannot focus an already focused space.".to_string()));
+    }
+
+    let cur = active.and_then(|sid| spaces.iter().position(|&s| s == sid));
+    let new = spaces.iter().position(|&s| s == target);
+    if let (Some(cur), Some(new)) = (cur, new) {
+        if let Err(error) = switch_space_by_gesture(new as i32 - cur as i32) {
+            return Some(Err(error.to_string()));
+        }
+    }
+
+    refresh_active_space(runtime, display_id);
+    Some(Ok(None))
+}
+
+/// Resolve a `space` selector to a concrete space id against the global,
+/// mission-control-ordered space list (1-based indices), matching
+/// `parse_space_selector`. `recent`/`mouse`/labels and the unsupported direction
+/// and stack forms are reported rather than silently ignored.
+fn resolve_space_target(
+    spaces: &[u64],
+    active: Option<u64>,
+    selector: &Selector,
+) -> Result<u64, String> {
+    let relative = |offset: i32| -> Result<u64, String> {
+        let active = active.ok_or_else(|| "could not locate the selected space.".to_string())?;
+        let index = spaces
+            .iter()
+            .position(|&s| s == active)
+            .ok_or_else(|| "could not locate the selected space.".to_string())?;
+        usize::try_from(index as i32 + offset)
+            .ok()
+            .and_then(|i| spaces.get(i))
+            .copied()
+            .ok_or_else(|| "could not locate the requested space.".to_string())
+    };
+
+    match selector {
+        Selector::Index(n) => (*n >= 1)
+            .then(|| spaces.get(*n as usize - 1).copied())
+            .flatten()
+            .ok_or_else(|| format!("could not locate space with mission-control index '{n}'.")),
+        Selector::First => spaces
+            .first()
+            .copied()
+            .ok_or_else(|| "could not locate the first space.".to_string()),
+        Selector::Last => spaces
+            .last()
+            .copied()
+            .ok_or_else(|| "could not locate the last space.".to_string()),
+        Selector::Prev => relative(-1),
+        Selector::Next => relative(1),
+        _ => Err("space selector not yet supported by the Rust WM daemon.".to_string()),
+    }
+}
+
 /// Reconcile the managed window set for one app against what AX currently
 /// reports, registering newcomers in the sink and dropping windows that vanished
 /// (which robustly handles closes despite unreliable AX destroy notifications),
@@ -957,7 +1045,12 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
             WmWork::Message { tokens, reply } => {
                 refresh_display_spaces(&mut runtime, display.id, usable);
                 refresh_active_space(&mut runtime, display.id);
-                let response = runtime.message(&tokens);
+                // A lone `space --focus <sel>` needs a macOS-layer space switch the
+                // pure core can't perform; handle it here, otherwise fall through.
+                let response = match try_space_focus(&mut runtime, display.id, &tokens) {
+                    Some(response) => response,
+                    None => runtime.message(&tokens),
+                };
                 let _ = reply.send(response);
             }
         }
@@ -1088,5 +1181,48 @@ mod tests {
 
         actor.shutdown();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_space_target_by_index_and_ends() {
+        let spaces = [10, 20, 30];
+        assert_eq!(
+            resolve_space_target(&spaces, Some(20), &Selector::Index(1)),
+            Ok(10)
+        );
+        assert_eq!(
+            resolve_space_target(&spaces, Some(20), &Selector::First),
+            Ok(10)
+        );
+        assert_eq!(
+            resolve_space_target(&spaces, Some(20), &Selector::Last),
+            Ok(30)
+        );
+        assert!(resolve_space_target(&spaces, Some(20), &Selector::Index(4)).is_err());
+        assert!(resolve_space_target(&spaces, Some(20), &Selector::Index(0)).is_err());
+    }
+
+    #[test]
+    fn resolve_space_target_relative_does_not_wrap() {
+        let spaces = [10, 20, 30];
+        assert_eq!(
+            resolve_space_target(&spaces, Some(20), &Selector::Prev),
+            Ok(10)
+        );
+        assert_eq!(
+            resolve_space_target(&spaces, Some(20), &Selector::Next),
+            Ok(30)
+        );
+        // No wrap at the ends, matching space_manager_{prev,next}_space.
+        assert!(resolve_space_target(&spaces, Some(10), &Selector::Prev).is_err());
+        assert!(resolve_space_target(&spaces, Some(30), &Selector::Next).is_err());
+    }
+
+    #[test]
+    fn resolve_space_target_rejects_unsupported_selectors() {
+        let spaces = [10, 20, 30];
+        assert!(resolve_space_target(&spaces, Some(20), &Selector::Recent).is_err());
+        assert!(resolve_space_target(&spaces, Some(20), &Selector::Mouse).is_err());
+        assert!(resolve_space_target(&spaces, None, &Selector::Next).is_err());
     }
 }

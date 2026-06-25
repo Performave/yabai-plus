@@ -17,7 +17,7 @@ reconstructing context.
   the first real `LayoutSink` (`AxSink`) moving windows via the Accessibility API
   plus live CoreGraphics display discovery and AX window diagnostics. 105
   workspace tests pass. The shipped C `make` flow is unchanged.
-- Last updated: 2026-06-23.
+- Last updated: 2026-06-24.
 - User decisions captured:
   - The Rust rewrite may diverge permanently from upstream yabai. Rebaseability is no
     longer a primary constraint for this track.
@@ -27,6 +27,23 @@ reconstructing context.
     forcing literal Rust at the cost of fragile injection behavior.
 
 ## Progress log
+
+### 2026-06-24
+
+- WM daemon now tracks the focused window: `AXFocusedWindowChanged` feeds
+  `StateEvent::WindowFocused` into the pure core, guarded so only a focus on the
+  active space is recorded (`AppState::window_space_id` added).
+- First `--space` mutation: `space --focus <selector>` works without the
+  scripting addition. The daemon intercepts a lone `--focus` in `WmWork::Message`
+  (`try_space_focus`), resolves the selector against the global
+  mission-control-ordered space list (`yabai_macos::mission_control_spaces`), and
+  switches with `switch_space_by_gesture` — the high-velocity dock-swipe synthesis
+  the C uses as its SA-free fallback (`space_manager_focus_space_using_gesture`).
+  Single-display only: no cross-display cursor warp yet. Selector resolution
+  (`resolve_space_target`) mirrors `parse_space_selector` for
+  index/first/last/prev/next (no wrap); `recent`/`mouse`/labels are reported as
+  unsupported. `--switch`/`--move`/`--create`/`--destroy`/`--swap`/`--display`
+  still need the scripting addition (Phase 8). 113 workspace tests, clippy clean.
 
 ### 2026-06-23 (session 3)
 
@@ -914,8 +931,10 @@ Single-display, active-space tiling only.
 1. Multi-space + Mission Control: space discovery, startup per-space trees, and
    window-to-space assignment/routing now exist for the first display; space
    add/remove is refreshed by polling and active-space changes are notified.
-   Next implement `--space` focus/move/create/destroy commands and, later, SLS
-   create/destroy notifications.
+   `space --focus <sel>` now works (gesture-based, single-display). Still to do:
+   `--switch`/`--move`/`--create`/`--destroy`/`--swap`/`--display` (need the
+   scripting addition, Phase 8); cross-display cursor warp in the focus gesture;
+   and, later, SLS create/destroy notifications.
 2. Multi-display: the WM daemon tiles only `active_displays().next()` today; add
    per-display spaces and route windows to the display they're on.
 3. App launch/termination are now observed directly through NSWorkspace; the 3s

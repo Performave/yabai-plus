@@ -66,9 +66,19 @@ impl Drop for OwnedCf {
     }
 }
 
+type CGEventRef = *const c_void;
+
+// `kCGSessionEventTap` from <CoreGraphics/CGEventTypes.h>: post into the
+// per-session event stream so the gesture reaches the WindowServer.
+const K_CG_SESSION_EVENT_TAP: u32 = 1;
+
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> CFUUIDRef;
+    fn CGEventCreate(source: *const c_void) -> CGEventRef;
+    fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
+    fn CGEventSetDoubleValueField(event: CGEventRef, field: u32, value: f64);
+    fn CGEventPost(tap: u32, event: CGEventRef);
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -306,6 +316,100 @@ pub fn spaces_for_display(display_id: u32) -> io::Result<Vec<u64>> {
     }
 
     Ok(result)
+}
+
+/// Return every Mission Control space id in global desktop order — each
+/// display's spaces in turn, matching the C `space_manager_mission_control_*`
+/// helpers that flatten `SLSCopyManagedDisplaySpaces` in array order. The 1-based
+/// position in this list is the mission-control index shown by `query --spaces`.
+pub fn mission_control_spaces() -> io::Result<Vec<u64>> {
+    let spaces_key = owned_cfstring(b"Spaces\0")?;
+    let id_key = owned_cfstring(b"id64\0")?;
+
+    // SAFETY: `SLSMainConnectionID` returns the process' SkyLight connection;
+    // the returned array is owned and released at the end of this function.
+    let display_spaces = unsafe { SLSCopyManagedDisplaySpaces(SLSMainConnectionID()) };
+    if display_spaces.is_null() {
+        return Err(io::Error::other("failed to copy managed display spaces"));
+    }
+    let display_spaces = OwnedCf(display_spaces);
+
+    let mut result = Vec::new();
+    // SAFETY: `display_spaces` is a valid CFArray of display dictionaries; all
+    // dictionary and nested-array values are borrowed and null-checked before use.
+    unsafe {
+        let display_count = CFArrayGetCount(display_spaces.as_ptr() as CFArrayRef);
+        for display_index in 0..display_count {
+            let display_ref =
+                CFArrayGetValueAtIndex(display_spaces.as_ptr() as CFArrayRef, display_index)
+                    as CFDictionaryRef;
+            if display_ref.is_null() {
+                continue;
+            }
+
+            let spaces_ref = CFDictionaryGetValue(display_ref, spaces_key.as_ptr()) as CFArrayRef;
+            if spaces_ref.is_null() {
+                continue;
+            }
+
+            let space_count = CFArrayGetCount(spaces_ref);
+            for space_index in 0..space_count {
+                let space_ref = CFArrayGetValueAtIndex(spaces_ref, space_index) as CFDictionaryRef;
+                if space_ref.is_null() {
+                    continue;
+                }
+                let sid_ref = CFDictionaryGetValue(space_ref, id_key.as_ptr()) as CFNumberRef;
+                if let Some(sid) = cfnumber_u64(sid_ref) {
+                    result.push(sid);
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Switch the active space by `steps` desktops in the direction of its sign
+/// (positive = later/right, negative = earlier/left), skipping the Mission
+/// Control animation. macOS exposes no space-activation API, so — like the C
+/// daemon's scripting-addition-free fallback — this synthesizes a sequence of
+/// high-velocity dock-swipe gestures. Single-display only: it never warps the
+/// cursor across displays.
+///
+/// Technique attribution (via the C `space_manager_focus_space_using_gesture`):
+/// <https://github.com/jurplel/InstantSpaceSwitcher>, reverse-engineered from
+/// BetterTouchTool.
+pub fn switch_space_by_gesture(steps: i32) -> io::Result<()> {
+    if steps == 0 {
+        return Ok(());
+    }
+
+    // SAFETY: a null source is valid and yields an event with default fields.
+    let event = unsafe { CGEventCreate(std::ptr::null()) };
+    if event.is_null() {
+        return Err(io::Error::other("failed to create dock-swipe event"));
+    }
+    let event = OwnedCf(event);
+
+    let sign = if steps > 0 { 1.0 } else { -1.0 };
+    // SAFETY: `event` is a valid CGEvent; the magic field ids/values mirror the C
+    // daemon exactly (kCGSEventTypeField=55 -> kCGSEventDockControl=30, etc.).
+    unsafe {
+        let ev = event.as_ptr();
+        CGEventSetIntegerValueField(ev, 55, 30); // kCGSEventTypeField -> kCGSEventDockControl
+        CGEventSetIntegerValueField(ev, 110, 23); // kCGEventGestureHIDType -> kIOHIDEventTypeDockSwipe
+        CGEventSetIntegerValueField(ev, 123, 1); // kCGEventGestureSwipeMotion -> horizontal
+        CGEventSetDoubleValueField(ev, 124, sign); // kCGEventGestureSwipeProgress
+        CGEventSetDoubleValueField(ev, 129, sign * 9999.0); // kCGEventGestureSwipeVelocityX
+        for _ in 0..steps.abs() {
+            CGEventSetIntegerValueField(ev, 132, 1); // kCGEventGesturePhase -> began
+            CGEventPost(K_CG_SESSION_EVENT_TAP, ev);
+            CGEventSetIntegerValueField(ev, 132, 4); // kCGEventGesturePhase -> ended
+            CGEventPost(K_CG_SESSION_EVENT_TAP, ev);
+        }
+    }
+
+    Ok(())
 }
 
 /// Return the Mission Control space ids containing `window_id`.
