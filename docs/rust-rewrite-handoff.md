@@ -24,7 +24,10 @@ reconstructing context.
   is modeled and executed: `signal --add/--list/--remove` plus live firing of
   `window_focused`, `application_launched/terminated`, and `space_changed`
   actions. `mouse_follows_focus` warps the cursor to the focused window on focus.
-  134 workspace tests pass. The shipped C `make` flow is unchanged.
+  The `rule` domain is modeled and executed for stored rules, list/remove/apply,
+  one-shot removal, regex matching, and the live `manage` effect (`manage=off`
+  floats/untiles, `manage=on` retiles); other rule effects are parsed/stored but
+  deferred. 143 workspace tests pass. The shipped C `make` flow is unchanged.
 - Last updated: 2026-06-25.
 - User decisions captured:
   - The Rust rewrite may diverge permanently from upstream yabai. Rebaseability is no
@@ -35,6 +38,43 @@ reconstructing context.
     forcing literal Rust at the cost of fragile injection behavior.
 
 ## Progress log
+
+### 2026-06-25 (session 11) — rule domain manage effects
+
+- The Rust WM now handles the `rule` domain in `AppState`: `rule --add`,
+  `--list`, `--remove`, and `--apply` are parsed and dispatched. `--add` supports
+  `--one-shot`; `--apply` supports all rules, index/label selectors, and ad-hoc
+  `key=value` filters/effects (`rule --apply app=... manage=...`). Rules compile
+  their `app`/`title`/`role`/`subrole` filters with `regex-lite`, preserve C-style
+  exclusion semantics, replace prior rules with the same label, and serialize in
+  the C `rule --list` JSON shape including flags.
+- The first live rule effect is wired: `manage=off` marks a matching window
+  floating and removes it from BSP trees; `manage=on` clears that floating mark
+  and reassigns it to its last-known space. `AppState` now tracks last-known
+  window space separately from tree membership so `rule --apply ... manage=on`
+  can retile a previously floated window without guessing from active space.
+  Reconcile keeps floating windows out of trees on later ticks.
+- One-shot rules now participate only in new-window application, then remove
+  themselves after a match, mirroring the C `RULE_ONE_SHOT_REMOVE` cleanup. The
+  live daemon applies rules only when a window is first seen; `rule --apply`
+  re-evaluates known windows through the pure state layer. Unsupported live rule
+  effects (`sticky`, `opacity`, `sub-layer`, `grid`, `display`/`space`,
+  `native-fullscreen`, `scratchpad`, and per-window `mouse_follows_focus`) are
+  parsed/stored/listed but not enacted yet.
+- Live remote verification on macOS 26.2 with the WM daemon over Finder on
+  isolated socket `/tmp/yabai_rtest.socket`: initial tiled window count was 10;
+  `rule --add app='^Finder$' manage=off label=fin` then `rule --apply fin`
+  reduced `query --windows id` count to 0; `rule --apply app='^Finder$'
+  manage=on` restored count to 10. A one-shot `manage=off` rule floated only the
+  next newly-created Finder window (count stayed 10) and `rule --list` returned
+  `[]`; creating a second Finder window then increased the tiled count to 11,
+  proving the one-shot had been removed. The two test Finder windows were closed
+  afterward. Follow-up with the rebuilt binary verified the C label/ad-hoc
+  precedence edge: a rule labeled `app=^Finder$` was preferred by `rule --apply
+  app=^Finder$` (count 10 -> 0), then removing it allowed ad-hoc `rule --apply
+  app=^Finder$ manage=on` to restore count 10.
+- Verification: `cargo fmt --all`; `cargo test --workspace` (143 tests);
+  `cargo clippy --workspace --all-targets`; `cargo build --release -p yabai`.
 
 ### 2026-06-25 (session 10) — mouse_follows_focus
 

@@ -736,10 +736,20 @@ fn take_optional_selector(
 /// A parsed `rule` message. Mirrors `handle_domain_rule`'s subcommands.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuleCommand {
-    Add(Vec<KeyValue>),
+    Add {
+        one_shot: bool,
+        pairs: Vec<KeyValue>,
+    },
     Remove(Option<Selector>),
-    Apply(Option<Selector>),
+    Apply(RuleApply),
     List,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RuleApply {
+    All,
+    Selector(Selector),
+    AdHoc { label: String, pairs: Vec<KeyValue> },
 }
 
 /// Parse the tokens following the `rule` domain (excluding the `rule` token).
@@ -747,14 +757,43 @@ pub fn parse_rule(tokens: &[String]) -> Result<RuleCommand, ParseError> {
     let mut iter = tokens.iter().peekable();
     let command = require(iter.next(), "rule", Domain::Rule)?;
     match command.as_str() {
-        "--add" => Ok(RuleCommand::Add(collect_key_values(iter)?)),
+        "--add" => {
+            // A leading `--one-shot` flag precedes the key-value filters/effects.
+            let one_shot = iter.peek().is_some_and(|tok| tok.as_str() == "--one-shot");
+            if one_shot {
+                iter.next();
+            }
+            Ok(RuleCommand::Add {
+                one_shot,
+                pairs: collect_key_values(iter)?,
+            })
+        }
         "--remove" => Ok(RuleCommand::Remove(take_optional_selector(&mut iter))),
-        "--apply" => Ok(RuleCommand::Apply(take_optional_selector(&mut iter))),
+        "--apply" => parse_rule_apply(iter),
         "--list" => Ok(RuleCommand::List),
         other => Err(ParseError::UnknownCommand {
             command: other.to_string(),
             domain: Domain::Rule,
         }),
+    }
+}
+
+fn parse_rule_apply(
+    mut iter: std::iter::Peekable<std::slice::Iter<String>>,
+) -> Result<RuleCommand, ParseError> {
+    let Some(first) = iter.next() else {
+        return Ok(RuleCommand::Apply(RuleApply::All));
+    };
+
+    match parse_key_value(first) {
+        Some(kv) => Ok(RuleCommand::Apply(RuleApply::AdHoc {
+            label: first.clone(),
+            pairs: collect_key_values_with_first(kv, iter)?,
+        })),
+        None if iter.peek().is_none() => Ok(RuleCommand::Apply(RuleApply::Selector(
+            parse_selector(first),
+        ))),
+        None => Err(ParseError::InvalidKeyValue(first.clone())),
     }
 }
 
@@ -786,7 +825,24 @@ pub fn parse_signal(tokens: &[String]) -> Result<SignalCommand, ParseError> {
 fn collect_key_values(
     iter: std::iter::Peekable<std::slice::Iter<String>>,
 ) -> Result<Vec<KeyValue>, ParseError> {
+    collect_key_values_with_firsts(None, iter)
+}
+
+fn collect_key_values_with_first(
+    first: KeyValue,
+    iter: std::iter::Peekable<std::slice::Iter<String>>,
+) -> Result<Vec<KeyValue>, ParseError> {
+    collect_key_values_with_firsts(Some(first), iter)
+}
+
+fn collect_key_values_with_firsts(
+    first: Option<KeyValue>,
+    iter: std::iter::Peekable<std::slice::Iter<String>>,
+) -> Result<Vec<KeyValue>, ParseError> {
     let mut pairs = Vec::new();
+    if let Some(first) = first {
+        pairs.push(first);
+    }
     for token in iter {
         match parse_key_value(token) {
             Some(kv) => pairs.push(kv),
@@ -1262,24 +1318,66 @@ mod tests {
         let cmd = parse_rule(&toks(&["--add", "app=Safari", "manage=off"])).unwrap();
         assert_eq!(
             cmd,
-            RuleCommand::Add(vec![
-                KeyValue {
+            RuleCommand::Add {
+                one_shot: false,
+                pairs: vec![
+                    KeyValue {
+                        key: "app".to_string(),
+                        value: "Safari".to_string(),
+                        exclusion: false,
+                    },
+                    KeyValue {
+                        key: "manage".to_string(),
+                        value: "off".to_string(),
+                        exclusion: false,
+                    },
+                ],
+            }
+        );
+
+        // `--one-shot` is consumed as a flag, not a key-value.
+        assert_eq!(
+            parse_rule(&toks(&["--add", "--one-shot", "app=Safari"])).unwrap(),
+            RuleCommand::Add {
+                one_shot: true,
+                pairs: vec![KeyValue {
                     key: "app".to_string(),
                     value: "Safari".to_string(),
                     exclusion: false,
-                },
-                KeyValue {
-                    key: "manage".to_string(),
-                    value: "off".to_string(),
-                    exclusion: false,
-                },
-            ])
+                }],
+            }
         );
 
         assert_eq!(parse_rule(&toks(&["--list"])).unwrap(), RuleCommand::List);
         assert_eq!(
             parse_rule(&toks(&["--remove", "myrule"])).unwrap(),
             RuleCommand::Remove(Some(Selector::Label("myrule".to_string())))
+        );
+        assert_eq!(
+            parse_rule(&toks(&["--apply"])).unwrap(),
+            RuleCommand::Apply(RuleApply::All)
+        );
+        assert_eq!(
+            parse_rule(&toks(&["--apply", "myrule"])).unwrap(),
+            RuleCommand::Apply(RuleApply::Selector(Selector::Label("myrule".to_string())))
+        );
+        assert_eq!(
+            parse_rule(&toks(&["--apply", "app=Safari", "manage=off"])).unwrap(),
+            RuleCommand::Apply(RuleApply::AdHoc {
+                label: "app=Safari".to_string(),
+                pairs: vec![
+                    KeyValue {
+                        key: "app".to_string(),
+                        value: "Safari".to_string(),
+                        exclusion: false,
+                    },
+                    KeyValue {
+                        key: "manage".to_string(),
+                        value: "off".to_string(),
+                        exclusion: false,
+                    },
+                ],
+            })
         );
     }
 

@@ -1171,6 +1171,23 @@ fn center_mouse_on_focus(runtime: &Runtime<AxSink>, window_id: u32) {
     let _ = warp_cursor_to_point(center);
 }
 
+/// Apply matching window rules to a window. Currently enacts the `manage` effect
+/// (off -> float, on -> tile); other effects (sticky/opacity/layer/grid/
+/// display/space/fullscreen) are parsed and stored but their application is
+/// deferred. Role/subrole are unknown at the AX layer here, so rules filtering on
+/// them will not match yet.
+fn apply_window_rules(
+    runtime: &mut Runtime<AxSink>,
+    window_id: u32,
+    app: &str,
+    title: &str,
+    sid: u64,
+) {
+    runtime
+        .state
+        .apply_new_window_rules(window_id, app, title, "", "", sid);
+}
+
 fn reconcile_pid(
     runtime: &mut Runtime<AxSink>,
     managed: &mut HashMap<i32, HashSet<u32>>,
@@ -1188,6 +1205,8 @@ fn reconcile_pid(
             continue;
         };
         current.insert(id);
+        let is_new = !known.contains(&id);
+        let (app, title) = (window.app.clone(), window.title.clone());
         // Refresh metadata every pass so titles stay current.
         runtime.state.set_window_meta(
             id,
@@ -1197,13 +1216,17 @@ fn reconcile_pid(
                 pid: window.pid,
             },
         );
-        if !known.contains(&id) {
+        if is_new {
             // A genuinely new window: hand its element to the sink and tree.
             runtime.sink.register(id, window.window);
         }
         let _ = runtime
             .state
             .handle_event(StateEvent::WindowAssignedToSpace { window_id: id, sid });
+        // Apply window rules once, when the window is first seen.
+        if is_new {
+            apply_window_rules(runtime, id, &app, &title, sid);
+        }
         // Else it is already managed; the freshly discovered duplicate element
         // drops here, leaving the existing registration intact.
     }

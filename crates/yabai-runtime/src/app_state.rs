@@ -13,10 +13,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+use regex_lite::Regex;
 use yabai_core::{
-    Area, ConfigOp, Message, NodeSplit, QueryCommand, QueryScopeKind, QueryTarget, Selector,
-    Signal, SignalCommand, SignalEvent, SpaceAction, Tree, ViewType, WindowAction, WindowFrame,
-    ZoomKind, parse_message,
+    Area, ConfigOp, Layer, Message, NodeSplit, QueryCommand, QueryScopeKind, QueryTarget, Rule,
+    RuleApply, RuleCommand, RuleEffects, Selector, Signal, SignalCommand, SignalEvent, SpaceAction,
+    Tree, ViewType, WindowAction, WindowFrame, ZoomKind, parse_message,
 };
 
 use crate::config::Config;
@@ -100,6 +101,7 @@ pub struct AppState {
     active_space: Option<u64>,
     focused_window: Option<u32>,
     window_meta: HashMap<u32, WindowMeta>,
+    window_spaces: HashMap<u32, u64>,
     /// Windows the user floated (`window --toggle float`): kept out of every tree
     /// so they are never tiled, and skipped by reconcile's space assignment.
     floating: HashSet<u32>,
@@ -110,6 +112,44 @@ pub struct AppState {
     /// Registered `signal`s in insertion order. The pure layer stores them and
     /// resolves which fire for an event; the daemon runs the action commands.
     signals: Vec<Signal>,
+    /// Registered window `rule`s in insertion order, each with its filter
+    /// patterns pre-compiled. The daemon evaluates these against new windows.
+    rules: Vec<CompiledRule>,
+}
+
+/// A [`Rule`] with its filter patterns compiled to regexes. Absent filters keep
+/// a `None` matcher (they never reject a window, matching the C `RULE_*_VALID`
+/// behavior).
+#[derive(Debug)]
+struct CompiledRule {
+    rule: Rule,
+    app: Option<Regex>,
+    title: Option<Regex>,
+    role: Option<Regex>,
+    subrole: Option<Regex>,
+}
+
+impl CompiledRule {
+    /// Whether this rule matches a window, mirroring
+    /// `window_manager_rule_matches_window`: every present filter must match
+    /// (or, for an `!=` filter, must not match). Role/subrole default to empty
+    /// strings until AX role discovery is wired up.
+    fn matches(&self, app: &str, title: &str, role: &str, subrole: &str) -> bool {
+        filter_ok(self.app.as_ref(), self.rule.app_exclude, app)
+            && filter_ok(self.title.as_ref(), self.rule.title_exclude, title)
+            && filter_ok(self.role.as_ref(), self.rule.role_exclude, role)
+            && filter_ok(self.subrole.as_ref(), self.rule.subrole_exclude, subrole)
+    }
+}
+
+/// One filter's verdict. An absent pattern never rejects. For a present pattern
+/// the C keeps the window iff `is_match == !exclude` (a normal filter requires a
+/// match; an `!=` filter requires a non-match), i.e. `is_match != exclude`.
+fn filter_ok(pattern: Option<&Regex>, exclude: bool, value: &str) -> bool {
+    match pattern {
+        None => true,
+        Some(re) => re.is_match(value) != exclude,
+    }
 }
 
 /// Lightweight per-window metadata the macOS layer supplies for queries
@@ -224,6 +264,23 @@ impl AppState {
         self.window_frame(window_id).map(|frame| frame.area)
     }
 
+    /// Every window with known metadata, as `(id, app, title, space)`, for the
+    /// daemon to re-evaluate rules against on `rule --apply`. Floating windows
+    /// report their last-known space; a window with no known space is skipped.
+    pub fn windows_with_meta(&self) -> Vec<(u32, String, String, u64)> {
+        let mut out = Vec::new();
+        for (&id, meta) in &self.window_meta {
+            let sid = self
+                .window_space(id)
+                .or_else(|| self.window_spaces.get(&id).copied());
+            if let Some(sid) = sid {
+                out.push((id, meta.app.clone(), meta.title.clone(), sid));
+            }
+        }
+        out.sort_unstable_by_key(|(id, ..)| *id);
+        out
+    }
+
     /// The owning process id for a window, from its stored metadata.
     pub fn window_pid(&self, window_id: u32) -> Option<i32> {
         self.window_meta.get(&window_id).map(|meta| meta.pid)
@@ -262,6 +319,7 @@ impl AppState {
 
     /// Assign a window to `sid`, removing it from any previous tree first.
     pub fn assign_window_to_space(&mut self, window_id: u32, sid: u64) -> Result<(), String> {
+        self.window_spaces.insert(window_id, sid);
         // Floating windows are never tiled; this no-op is what keeps reconcile
         // from re-adding them to a tree on every tick.
         if self.floating.contains(&window_id) {
@@ -298,6 +356,7 @@ impl AppState {
     /// also clearing any floating mark.
     pub fn remove_window(&mut self, window_id: u32) -> Result<(), String> {
         self.floating.remove(&window_id);
+        self.window_spaces.remove(&window_id);
         for tree in self.spaces.values_mut() {
             tree.remove_window(window_id);
         }
@@ -310,6 +369,21 @@ impl AppState {
     /// Whether `window_id` is currently floating (untiled).
     pub fn is_floating(&self, window_id: u32) -> bool {
         self.floating.contains(&window_id)
+    }
+
+    /// Float or unfloat a window (used by the daemon to apply a `manage` rule to a
+    /// freshly-discovered window). Floating drops it from every tree and marks it
+    /// so reconcile never re-tiles it; unfloating clears the mark and tiles it
+    /// back into `sid`.
+    pub fn set_window_floating(&mut self, window_id: u32, floating: bool, sid: u64) {
+        if floating {
+            self.floating.insert(window_id);
+            for tree in self.spaces.values_mut() {
+                tree.remove_window(window_id);
+            }
+        } else if self.floating.remove(&window_id) {
+            let _ = self.assign_window_to_space(window_id, sid);
+        }
     }
 
     /// Set a space's usable frame from its full display frame, insetting by the
@@ -448,11 +522,10 @@ impl AppState {
             Message::Space(cmd) => self.dispatch_space(&cmd.actions),
             Message::Query(cmd) => self.dispatch_query(&cmd),
             Message::Signal(cmd) => self.dispatch_signal(cmd),
+            Message::Rule(cmd) => self.dispatch_rule(cmd),
             // Domains whose effects need the macOS layers are accepted but not
             // yet enacted here; report them rather than silently succeeding.
-            Message::Display(_) | Message::Rule(_) => {
-                Err("domain not yet handled by AppState".to_string())
-            }
+            Message::Display(_) => Err("domain not yet handled by AppState".to_string()),
         }
     }
 
@@ -699,6 +772,225 @@ impl AppState {
             .filter(|s| s.event == event)
             .map(|s| s.action.clone())
             .collect()
+    }
+
+    fn dispatch_rule(&mut self, cmd: RuleCommand) -> Response {
+        match cmd {
+            RuleCommand::Add { one_shot, pairs } => {
+                let rule = Rule::from_key_values(&pairs, one_shot)?;
+                let compiled = compile_rule(rule)?;
+                // `rule_add` drops any prior rule with the same label.
+                if let Some(label) = &compiled.rule.label {
+                    self.rules.retain(|r| r.rule.label.as_ref() != Some(label));
+                }
+                self.rules.push(compiled);
+                Ok(None)
+            }
+            RuleCommand::Remove(selector) => self.remove_rule(selector.as_ref()),
+            RuleCommand::List => Ok(Some(self.serialize_rules())),
+            RuleCommand::Apply(apply) => self.apply_rule(apply),
+        }
+    }
+
+    fn apply_rule(&mut self, apply: RuleApply) -> Response {
+        match apply {
+            RuleApply::All => {
+                self.apply_all_non_one_shot_rules_to_known_windows();
+                Ok(None)
+            }
+            RuleApply::AdHoc { label, pairs } => {
+                if let Some(index) = self.rule_index_by_label(&label) {
+                    return self.apply_rule_index(index);
+                }
+                let rule = Rule::from_key_values(&pairs, false)?;
+                let compiled = compile_rule(rule)?;
+                self.apply_compiled_rule_to_known_windows(&compiled);
+                Ok(None)
+            }
+            RuleApply::Selector(selector) => self.apply_rule_selector(&selector),
+        }
+    }
+
+    fn remove_rule(&mut self, selector: Option<&Selector>) -> Response {
+        match selector {
+            Some(Selector::Index(index)) => {
+                if (*index as usize) < self.rules.len() {
+                    self.rules.remove(*index as usize);
+                    Ok(None)
+                } else {
+                    Err(format!("rule with index '{index}' not found.\n"))
+                }
+            }
+            Some(Selector::Label(label)) => {
+                match self
+                    .rules
+                    .iter()
+                    .position(|r| r.rule.label.as_deref() == Some(label))
+                {
+                    Some(pos) => {
+                        self.rules.remove(pos);
+                        Ok(None)
+                    }
+                    None => Err(format!("rule with label '{label}' not found.\n")),
+                }
+            }
+            _ => Err("a valid rule selector (index or label) is required.\n".to_string()),
+        }
+    }
+
+    /// The combined effects of every rule matching a window, applied in
+    /// registration order (later rules win per field), mirroring
+    /// `rule_combine_effects`. Role/subrole default to empty until AX role
+    /// discovery exists.
+    pub fn rule_effects_for_window(
+        &self,
+        app: &str,
+        title: &str,
+        role: &str,
+        subrole: &str,
+    ) -> RuleEffects {
+        self.combined_rule_effects_for_window(app, title, role, subrole, true)
+    }
+
+    /// Apply rules to a newly discovered live window. One-shot rules participate
+    /// in this pass and are removed after matching, like the C daemon's
+    /// `RULE_ONE_SHOT_REMOVE` cleanup after window creation.
+    pub fn apply_new_window_rules(
+        &mut self,
+        window_id: u32,
+        app: &str,
+        title: &str,
+        role: &str,
+        subrole: &str,
+        sid: u64,
+    ) -> RuleEffects {
+        let mut result = RuleEffects::default();
+        let mut remove = Vec::new();
+        for (index, compiled) in self.rules.iter().enumerate() {
+            if compiled.matches(app, title, role, subrole) {
+                combine_effects(&compiled.rule.effects, &mut result);
+                if compiled.rule.one_shot {
+                    remove.push(index);
+                }
+            }
+        }
+        for index in remove.into_iter().rev() {
+            self.rules.remove(index);
+        }
+        self.apply_manage_effects_to_window(window_id, sid, &result);
+        result
+    }
+
+    fn combined_rule_effects_for_window(
+        &self,
+        app: &str,
+        title: &str,
+        role: &str,
+        subrole: &str,
+        include_one_shot: bool,
+    ) -> RuleEffects {
+        let mut result = RuleEffects::default();
+        for compiled in &self.rules {
+            if (include_one_shot || !compiled.rule.one_shot)
+                && compiled.matches(app, title, role, subrole)
+            {
+                combine_effects(&compiled.rule.effects, &mut result);
+            }
+        }
+        result
+    }
+
+    fn apply_all_non_one_shot_rules_to_known_windows(&mut self) {
+        for (window_id, app, title, sid) in self.windows_with_meta() {
+            let effects = self.combined_rule_effects_for_window(&app, &title, "", "", false);
+            self.apply_manage_effects_to_window(window_id, sid, &effects);
+        }
+    }
+
+    fn apply_compiled_rule_to_known_windows(&mut self, compiled: &CompiledRule) {
+        let matches = self
+            .windows_with_meta()
+            .into_iter()
+            .filter_map(|(window_id, app, title, sid)| {
+                compiled
+                    .matches(&app, &title, "", "")
+                    .then_some((window_id, sid))
+            })
+            .collect::<Vec<_>>();
+        for (window_id, sid) in matches {
+            self.apply_manage_effects_to_window(window_id, sid, &compiled.rule.effects);
+        }
+    }
+
+    fn apply_rule_selector(&mut self, selector: &Selector) -> Response {
+        let Some(index) = self.resolve_rule_selector(selector)? else {
+            return Ok(None);
+        };
+        self.apply_rule_index(index)
+    }
+
+    fn apply_rule_index(&mut self, index: usize) -> Response {
+        let matches = {
+            let compiled = &self.rules[index];
+            if compiled.rule.one_shot {
+                return Ok(None);
+            }
+            self.windows_with_meta()
+                .into_iter()
+                .filter_map(|(window_id, app, title, sid)| {
+                    compiled
+                        .matches(&app, &title, "", "")
+                        .then_some((window_id, sid))
+                })
+                .collect::<Vec<_>>()
+        };
+        let effects = self.rules[index].rule.effects.clone();
+        for (window_id, sid) in matches {
+            self.apply_manage_effects_to_window(window_id, sid, &effects);
+        }
+        Ok(None)
+    }
+
+    fn resolve_rule_selector(&self, selector: &Selector) -> Result<Option<usize>, String> {
+        match selector {
+            Selector::Index(index) => {
+                if (*index as usize) < self.rules.len() {
+                    Ok(Some(*index as usize))
+                } else {
+                    Err(format!("rule with index '{index}' not found.\n"))
+                }
+            }
+            Selector::Label(label) => match self.rule_index_by_label(label) {
+                Some(pos) => Ok(Some(pos)),
+                None => Err(format!("rule with label '{label}' not found.\n")),
+            },
+            _ => Err("a valid rule selector (index or label) is required.\n".to_string()),
+        }
+    }
+
+    fn rule_index_by_label(&self, label: &str) -> Option<usize> {
+        self.rules
+            .iter()
+            .position(|r| r.rule.label.as_deref() == Some(label))
+    }
+
+    fn apply_manage_effects_to_window(&mut self, window_id: u32, sid: u64, effects: &RuleEffects) {
+        if let Some(manage) = effects.manage {
+            // manage=off -> floating (untiled); manage=on -> tiled.
+            self.set_window_floating(window_id, !manage, sid);
+        }
+    }
+
+    fn serialize_rules(&self) -> String {
+        let mut out = String::from("[");
+        for (index, compiled) in self.rules.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&serialize_rule(&compiled.rule, index));
+        }
+        out.push_str("]\n");
+        out
     }
 
     fn query_displays(&self, cmd: &QueryCommand) -> Response {
@@ -1183,6 +1475,149 @@ fn format_area(name: &str, area: Area) -> String {
 
 fn json_bool(value: bool) -> &'static str {
     if value { "true" } else { "false" }
+}
+
+/// Compile a rule's filter patterns, mapping a bad pattern to the C
+/// `daemon_fail` text for `regcomp` failure.
+fn compile_rule(rule: Rule) -> Result<CompiledRule, String> {
+    fn compile(pattern: &Option<String>, key: &str) -> Result<Option<Regex>, String> {
+        match pattern {
+            None => Ok(None),
+            Some(p) => Regex::new(p)
+                .map(Some)
+                .map_err(|_| format!("invalid regex pattern '{p}' for key '{key}'\n")),
+        }
+    }
+    let app = compile(&rule.app, "app")?;
+    let title = compile(&rule.title, "title")?;
+    let role = compile(&rule.role, "role")?;
+    let subrole = compile(&rule.subrole, "subrole")?;
+    Ok(CompiledRule {
+        rule,
+        app,
+        title,
+        role,
+        subrole,
+    })
+}
+
+/// Merge one rule's effects into the accumulating result (later rules win per
+/// field), mirroring `rule_combine_effects`.
+fn combine_effects(effects: &RuleEffects, result: &mut RuleEffects) {
+    if effects.manage.is_some() {
+        result.manage = effects.manage;
+    }
+    if effects.sticky.is_some() {
+        result.sticky = effects.sticky;
+    }
+    if effects.mff.is_some() {
+        result.mff = effects.mff;
+    }
+    if effects.fullscreen.is_some() {
+        result.fullscreen = effects.fullscreen;
+    }
+    if effects.opacity.is_some() {
+        result.opacity = effects.opacity;
+    }
+    if effects.layer.is_some() {
+        result.layer = effects.layer;
+    }
+    if effects.grid.is_some() {
+        result.grid = effects.grid;
+    }
+    if effects.scratchpad.is_some() {
+        result.scratchpad = effects.scratchpad.clone();
+    }
+    if effects.display.is_some() {
+        result.display = effects.display.clone();
+        result.follow_space = effects.follow_space;
+    }
+    if effects.space.is_some() {
+        result.space = effects.space.clone();
+        result.follow_space = effects.follow_space;
+    }
+}
+
+/// Serialize a rule as `rule_serialize` does. `display`/`space` resolve to live
+/// arrangement/Mission-Control indices in the C daemon; that resolution is
+/// deferred here, so both serialize as `0`.
+fn serialize_rule(rule: &Rule, index: usize) -> String {
+    let effects = &rule.effects;
+    // flags hex: (effects.flags << 16) | rule.flags, bit values from rule.h.
+    let mut rule_flags: u32 = 0;
+    if rule.app.is_some() {
+        rule_flags |= 0x001;
+    }
+    if rule.title.is_some() {
+        rule_flags |= 0x002;
+    }
+    if rule.role.is_some() {
+        rule_flags |= 0x004;
+    }
+    if rule.subrole.is_some() {
+        rule_flags |= 0x008;
+    }
+    if rule.app_exclude {
+        rule_flags |= 0x010;
+    }
+    if rule.title_exclude {
+        rule_flags |= 0x020;
+    }
+    if rule.role_exclude {
+        rule_flags |= 0x040;
+    }
+    if rule.subrole_exclude {
+        rule_flags |= 0x080;
+    }
+    if rule.one_shot {
+        rule_flags |= 0x100;
+    }
+    let mut effect_flags: u32 = 0;
+    if effects.follow_space {
+        effect_flags |= 0x01;
+    }
+    if effects.opacity.is_some() {
+        effect_flags |= 0x02;
+    }
+    if effects.layer.is_some() {
+        effect_flags |= 0x04;
+    }
+    let flags = (effect_flags << 16) | rule_flags;
+
+    let grid = effects.grid.unwrap_or([0; 6]);
+    format!(
+        "{{\n\t\"index\":{index},\n\t\"label\":\"{}\",\n\t\"app\":\"{}\",\n\t\"title\":\"{}\",\n\t\"role\":\"{}\",\n\t\"subrole\":\"{}\",\n\t\"display\":0,\n\t\"space\":0,\n\t\"follow_space\":{},\n\t\"opacity\":{:.4},\n\t\"manage\":{},\n\t\"sticky\":{},\n\t\"mouse_follows_focus\":{},\n\t\"sub-layer\":\"{}\",\n\t\"native-fullscreen\":{},\n\t\"grid\":\"{}:{}:{}:{}:{}:{}\",\n\t\"scratchpad\":\"{}\",\n\t\"one-shot\":{},\n\t\"flags\":\"0x{:08x}\"\n}}",
+        json_escape(rule.label.as_deref().unwrap_or("")),
+        json_escape(rule.app.as_deref().unwrap_or("")),
+        json_escape(rule.title.as_deref().unwrap_or("")),
+        json_escape(rule.role.as_deref().unwrap_or("")),
+        json_escape(rule.subrole.as_deref().unwrap_or("")),
+        json_bool(effects.follow_space),
+        effects.opacity.unwrap_or(0.0),
+        optional_bool(effects.manage),
+        optional_bool(effects.sticky),
+        optional_bool(effects.mff),
+        effects.layer.map(Layer::as_str).unwrap_or(""),
+        optional_bool(effects.fullscreen),
+        grid[0],
+        grid[1],
+        grid[2],
+        grid[3],
+        grid[4],
+        grid[5],
+        json_escape(effects.scratchpad.as_deref().unwrap_or("")),
+        json_bool(rule.one_shot),
+        flags,
+    )
+}
+
+/// `json_optional_bool`: unset -> `null`, on -> `true`, off -> `false`.
+fn optional_bool(value: Option<bool>) -> &'static str {
+    match value {
+        None => "null",
+        Some(true) => "true",
+        Some(false) => "false",
+    }
 }
 
 /// Escape a string for embedding in a JSON string literal (quotes, backslashes,
@@ -1829,7 +2264,179 @@ mod tests {
     #[test]
     fn unhandled_domain_reports() {
         let mut state = AppState::new();
-        assert!(state.handle_tokens(&toks(&["rule", "--list"])).is_err());
+        // `display` effects still need the macOS layer; it reports rather than
+        // silently succeeding. (`rule`/`signal` are now handled.)
+        assert!(
+            state
+                .handle_tokens(&toks(&["display", "--focus", "1"]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rules_add_match_list_remove() {
+        let mut state = AppState::new();
+        state
+            .handle_tokens(&toks(&[
+                "rule",
+                "--add",
+                "app=^Finder$",
+                "manage=off",
+                "label=fin",
+            ]))
+            .unwrap();
+        // Matching window gets manage=off; a non-match gets no effects.
+        assert_eq!(
+            state.rule_effects_for_window("Finder", "", "", "").manage,
+            Some(false)
+        );
+        assert_eq!(
+            state.rule_effects_for_window("Safari", "", "", "").manage,
+            None
+        );
+
+        // An exclusion filter inverts the match.
+        state
+            .handle_tokens(&toks(&["rule", "--add", "app!=^Finder$", "manage=on"]))
+            .unwrap();
+        assert_eq!(
+            state.rule_effects_for_window("Safari", "", "", "").manage,
+            Some(true)
+        );
+
+        // `--list` serializes both rules; spot-check the first.
+        let list = state
+            .handle_tokens(&toks(&["rule", "--list"]))
+            .unwrap()
+            .unwrap();
+        assert!(list.contains("\"app\":\"^Finder$\""));
+        assert!(list.contains("\"manage\":false"));
+        assert!(list.contains("\"label\":\"fin\""));
+
+        // Remove by label, then a bad index/label errors.
+        state
+            .handle_tokens(&toks(&["rule", "--remove", "fin"]))
+            .unwrap();
+        assert_eq!(
+            state.rule_effects_for_window("Finder", "", "", "").manage,
+            None
+        );
+        assert!(
+            state
+                .handle_tokens(&toks(&["rule", "--remove", "ghost"]))
+                .unwrap_err()
+                .contains("rule with label 'ghost' not found")
+        );
+    }
+
+    #[test]
+    fn rule_add_rejects_bad_regex() {
+        let mut state = AppState::new();
+        let err = state
+            .handle_tokens(&toks(&["rule", "--add", "app=("]))
+            .unwrap_err();
+        assert!(err.contains("invalid regex pattern '(' for key 'app'"));
+    }
+
+    #[test]
+    fn rule_apply_enacts_manage_for_known_windows() {
+        let mut state = state_with_space();
+        state.add_window(1).unwrap();
+        state.add_window(2).unwrap();
+        state.set_window_meta(
+            1,
+            WindowMeta {
+                app: "Finder".to_string(),
+                title: "One".to_string(),
+                pid: 10,
+            },
+        );
+        state.set_window_meta(
+            2,
+            WindowMeta {
+                app: "Safari".to_string(),
+                title: "Two".to_string(),
+                pid: 20,
+            },
+        );
+
+        state
+            .handle_tokens(&toks(&[
+                "rule",
+                "--add",
+                "app=^Finder$",
+                "manage=off",
+                "label=fin",
+            ]))
+            .unwrap();
+        state
+            .handle_tokens(&toks(&["rule", "--apply", "fin"]))
+            .unwrap();
+        assert!(state.is_floating(1));
+        assert_eq!(state.space(1).unwrap().window_list(), vec![2]);
+
+        state
+            .handle_tokens(&toks(&["rule", "--apply", "app=^Finder$", "manage=on"]))
+            .unwrap();
+        assert!(!state.is_floating(1));
+        let mut list = state.space(1).unwrap().window_list();
+        list.sort_unstable();
+        assert_eq!(list, vec![1, 2]);
+    }
+
+    #[test]
+    fn rule_apply_prefers_label_before_adhoc_rule() {
+        let mut state = state_with_space();
+        state.add_window(1).unwrap();
+        state.set_window_meta(
+            1,
+            WindowMeta {
+                app: "Finder".to_string(),
+                title: "One".to_string(),
+                pid: 10,
+            },
+        );
+        state
+            .handle_tokens(&toks(&[
+                "rule",
+                "--add",
+                "app=^Finder$",
+                "manage=off",
+                "label=app=^Finder$",
+            ]))
+            .unwrap();
+
+        state
+            .handle_tokens(&toks(&["rule", "--apply", "app=^Finder$"]))
+            .unwrap();
+        assert!(state.is_floating(1));
+    }
+
+    #[test]
+    fn one_shot_rule_is_removed_after_new_window_match() {
+        let mut state = state_with_space();
+        state
+            .handle_tokens(&toks(&[
+                "rule",
+                "--add",
+                "--one-shot",
+                "app=^Finder$",
+                "manage=off",
+            ]))
+            .unwrap();
+
+        state.add_window(1).unwrap();
+        state.apply_new_window_rules(1, "Finder", "", "", "", 1);
+        assert!(state.is_floating(1));
+        assert_eq!(
+            state.handle_tokens(&toks(&["rule", "--list"])).unwrap(),
+            Some("[]\n".to_string())
+        );
+
+        state.add_window(2).unwrap();
+        state.apply_new_window_rules(2, "Finder", "", "", "", 1);
+        assert!(!state.is_floating(2));
+        assert_eq!(state.space(1).unwrap().window_list(), vec![2]);
     }
 
     #[test]
