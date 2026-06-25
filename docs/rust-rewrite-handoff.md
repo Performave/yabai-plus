@@ -17,7 +17,7 @@ reconstructing context.
   the first real `LayoutSink` (`AxSink`) moving windows via the Accessibility API
   plus live CoreGraphics display discovery and AX window diagnostics. 105
   workspace tests pass. The shipped C `make` flow is unchanged.
-- Last updated: 2026-06-24.
+- Last updated: 2026-06-25.
 - User decisions captured:
   - The Rust rewrite may diverge permanently from upstream yabai. Rebaseability is no
     longer a primary constraint for this track.
@@ -27,6 +27,24 @@ reconstructing context.
     forcing literal Rust at the cost of fragile injection behavior.
 
 ## Progress log
+
+### 2026-06-25
+
+- Real `window --focus <selector>`: the pure core already resolves the target
+  into `focused_window`; the daemon now enacts it on the live window via a new
+  `AxSink::focus_window` that mirrors `window_manager_focus_window_with_raise` —
+  `_SLPSSetFrontProcessWithOptions` + the synthesized make-key-window event
+  records (`SLPSPostEventRecordTo`, byte layout copied from `g_event_bytes`) +
+  `AXRaise`. PSN comes from Carbon `GetProcessForPID` (deprecated but resolves at
+  runtime), the same source as the C process manager. The daemon calls it after a
+  successful `window --focus` (guarded by `is_window_focus`, which ignores a bare
+  `--focus` with no selector). `AppState::focused_window_id` getter added.
+  113 workspace tests, clippy clean.
+- Verified live on the remote MacBook Air (macOS 26.2): the full tiling daemon
+  arranges three real Finder windows in a BSP layout; `space --rotate 90` over the
+  socket re-tiles them; `window --focus west` moves the real key window (traffic
+  lights follow, `has-focus` flips). Screenshots captured via the runbook in
+  `REMOTE_TESTING.local.md` (git-excluded).
 
 ### 2026-06-24
 
@@ -951,7 +969,8 @@ Single-display, active-space tiling only.
    per-display spaces and route windows to the display they're on.
 3. App launch/termination are now observed directly through NSWorkspace; the 3s
    tick remains a backstop for missed AX/window changes and CGWindowList pickup.
-4. More window ops needing live state: focus (raise/without-raise), minimize/
+4. More window ops needing live state: `window --focus` with-raise now works
+   (`AxSink::focus_window`); still to do: focus without-raise, minimize/
    fullscreen/sticky/scratchpad, opacity/layer; mouse drag move/resize/swap;
    rules + signals execution.
 5. Then Phases 7-9: scripting addition (`yabai-sa`, currently empty — required

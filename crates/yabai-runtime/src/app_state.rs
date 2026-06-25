@@ -176,6 +176,10 @@ impl AppState {
         self.focused_window = window_id;
     }
 
+    pub fn focused_window_id(&self) -> Option<u32> {
+        self.focused_window
+    }
+
     /// Record (or replace) a window's macOS metadata for queries.
     pub fn set_window_meta(&mut self, window_id: u32, meta: WindowMeta) {
         self.window_meta.insert(window_id, meta);

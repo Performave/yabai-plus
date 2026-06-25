@@ -6,7 +6,9 @@ use std::sync::mpsc::{Sender, SyncSender, channel, sync_channel};
 use std::thread;
 use std::time::Duration;
 
-use yabai_core::{Area, Message, Selector, SpaceAction, parse_message, parse_selector};
+use yabai_core::{
+    Area, Message, Selector, SpaceAction, WindowAction, parse_message, parse_selector,
+};
 use yabai_ipc::{FAILURE_MARKER, daemon_socket_path, decode_client_payload, send_message};
 use yabai_macos::ax::DiscoveredAxWindow;
 use yabai_macos::{
@@ -710,6 +712,18 @@ fn run_space_probe(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// True if `tokens` is a `window --focus <selector>` command — the pure core
+/// resolves the target into `focused_window`, and the daemon then raises the real
+/// window. A bare `window --focus` (no selector) carries no target, so it's not
+/// treated as a focus move.
+fn is_window_focus(tokens: &[String]) -> bool {
+    matches!(
+        parse_message(tokens),
+        Ok(Message::Window(cmd))
+            if cmd.actions.iter().any(|action| matches!(action, WindowAction::Focus(Some(_))))
+    )
+}
+
 /// Intercept a standalone `space --focus <selector>` and enact the active-space
 /// switch through the macOS layer, returning `Some(response)`. Any other message
 /// (including a `--focus` mixed with other actions) returns `None` so the caller
@@ -1127,6 +1141,13 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                     Some(response) => response,
                     None => runtime.message(&tokens),
                 };
+                // A successful `window --focus` updated the pure focus target;
+                // now enact it on the real window (raise + make key).
+                if response.is_ok() && is_window_focus(&tokens) {
+                    if let Some(window_id) = runtime.state.focused_window_id() {
+                        runtime.sink.focus_window(window_id);
+                    }
+                }
                 let _ = reply.send(response);
             }
         }

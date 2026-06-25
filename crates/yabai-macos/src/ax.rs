@@ -106,11 +106,31 @@ unsafe extern "C" {
         attribute: CFStringRef,
         settable: *mut Boolean,
     ) -> i32;
+    fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> i32;
+    // Carbon Process Manager: deprecated but still resolves at runtime, and the
+    // only way (besides launch events) to map a pid to its `ProcessSerialNumber`,
+    // exactly as `process_manager_add_running_processes` does in the C daemon.
+    fn GetProcessForPID(pid: i32, psn: *mut ProcessSerialNumber) -> i32;
 }
+
+/// Carbon `ProcessSerialNumber`: the `SLPS*` front/key-window APIs key on this,
+/// not the pid.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcessSerialNumber {
+    high: u32,
+    low: u32,
+}
+
+// `kCPSUserGenerated` from `window_manager.h`: mark the front-process change as
+// user-initiated so the WindowServer treats it like a real click.
+const K_CPS_USER_GENERATED: u32 = 0x200;
 
 #[link(name = "SkyLight", kind = "framework")]
 unsafe extern "C" {
     fn _AXUIElementGetWindow(element: AXUIElementRef, window_id: *mut u32) -> i32;
+    fn _SLPSSetFrontProcessWithOptions(psn: *mut ProcessSerialNumber, wid: u32, mode: u32) -> i32;
+    fn SLPSPostEventRecordTo(psn: *mut ProcessSerialNumber, bytes: *mut u8) -> i32;
 }
 
 /// Create a CoreFoundation string from a NUL-terminated ASCII literal.
@@ -1008,6 +1028,70 @@ impl AxSink {
 
     pub fn is_registered(&self, window_id: u32) -> bool {
         self.windows.contains_key(&window_id)
+    }
+
+    /// Focus a managed window: bring its app to the front with this window key,
+    /// then raise the window. Mirrors `window_manager_focus_window_with_raise` —
+    /// `_SLPSSetFrontProcessWithOptions` + the synthesized make-key-window event
+    /// records + `AXRaise`. Returns `false` if the window is not registered or its
+    /// pid/PSN can't be resolved.
+    pub fn focus_window(&self, window_id: u32) -> bool {
+        let Some(window) = self.windows.get(&window_id) else {
+            return false;
+        };
+        let element = window.element;
+        let Some(pid) = ax_pid(element) else {
+            return false;
+        };
+
+        let mut psn = ProcessSerialNumber { high: 0, low: 0 };
+        // SAFETY: `psn` is a valid out pointer; GetProcessForPID fills it for a
+        // live pid and returns non-zero (`procNotFound`) otherwise.
+        if unsafe { GetProcessForPID(pid, &mut psn) } != 0 {
+            return false;
+        }
+
+        // SAFETY: `psn` is a valid Carbon PSN for a live process and `element` is
+        // a retained AX window element owned by the sink. The make-key-window
+        // event-record bytes mirror the C daemon's `g_event_bytes` layout exactly.
+        unsafe {
+            _SLPSSetFrontProcessWithOptions(&mut psn, window_id, K_CPS_USER_GENERATED);
+            make_key_window(&mut psn, window_id);
+            AXUIElementPerformAction(element, AX_RAISE_ACTION.with(|a| *a));
+        }
+        true
+    }
+}
+
+thread_local! {
+    /// `kAXRaiseAction` ("AXRaise") as an owned CFString, created once per thread.
+    /// The sink is single-threaded (one actor), so this is effectively a singleton.
+    static AX_RAISE_ACTION: CFStringRef = {
+        // SAFETY: the literal is NUL-terminated; the CFString lives for the
+        // thread's lifetime (never released), matching the C constant.
+        unsafe { cfstring(b"AXRaise\0") }
+    };
+}
+
+/// Synthesize the two "make key window" event records the WindowServer's
+/// annotated-session event tap consumes, posting them to `psn`. Byte offsets and
+/// values mirror `window_manager_make_key_window` in the C daemon.
+unsafe fn make_key_window(psn: *mut ProcessSerialNumber, window_id: u32) {
+    let mut bytes = [0u8; 0x100];
+    bytes[0x04] = 0xf8;
+    bytes[0x3a] = 0x10;
+    bytes[0x3c..0x40].copy_from_slice(&window_id.to_ne_bytes());
+    for b in &mut bytes[0x20..0x30] {
+        *b = 0xff;
+    }
+
+    // SAFETY: `psn` is a valid PSN and `bytes` is a 0x100-byte buffer (the C
+    // daemon allocates the same), live for both posts.
+    unsafe {
+        bytes[0x08] = 0x01;
+        SLPSPostEventRecordTo(psn, bytes.as_mut_ptr());
+        bytes[0x08] = 0x02;
+        SLPSPostEventRecordTo(psn, bytes.as_mut_ptr());
     }
 }
 
