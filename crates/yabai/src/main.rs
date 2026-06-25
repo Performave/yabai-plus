@@ -895,9 +895,24 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
     for work in rx {
         match work {
             WmWork::Observed(event) => {
+                let pid = event.pid();
+                let focused = match &event {
+                    ObservedEvent::FocusedWindowChanged {
+                        window_id: Some(id),
+                        ..
+                    } => Some(*id),
+                    _ => None,
+                };
                 refresh_display_spaces(&mut runtime, display.id, usable);
                 refresh_active_space(&mut runtime, display.id);
-                reconcile_pid(&mut runtime, &mut managed, event.pid());
+                reconcile_pid(&mut runtime, &mut managed, pid);
+                if let Some(window_id) = focused {
+                    if runtime.state.window_space_id(window_id) == runtime.state.active_space_id() {
+                        let _ = runtime
+                            .state
+                            .handle_event(StateEvent::WindowFocused { window_id });
+                    }
+                }
             }
             WmWork::Workspace(event) => match event {
                 WorkspaceEvent::ActiveSpaceChanged => {

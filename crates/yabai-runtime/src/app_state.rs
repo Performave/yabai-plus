@@ -160,6 +160,10 @@ impl AppState {
         self.display_spaces(display_id)
     }
 
+    pub fn window_space_id(&self, window_id: u32) -> Option<u64> {
+        self.window_space(window_id)
+    }
+
     pub fn set_active_space(&mut self, sid: u64) {
         self.active_space = Some(sid);
     }
@@ -1168,6 +1172,7 @@ mod tests {
 
         assert!(state.space(1).unwrap().window_list().is_empty());
         assert_eq!(state.space(2).unwrap().window_list(), vec![20]);
+        assert_eq!(state.window_space_id(20), Some(2));
         assert!(state.flush_active().unwrap().is_empty());
     }
 
