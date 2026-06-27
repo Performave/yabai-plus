@@ -37,7 +37,7 @@ reconstructing context.
   The `rule` domain is modeled and executed for stored rules, list/remove/apply,
   one-shot removal, regex matching, and the live `manage` effect (`manage=off`
   floats/untiles, `manage=on` retiles); other rule effects are parsed/stored but
-  deferred. 149 workspace tests pass. The shipped C `make` flow is unchanged.
+  deferred. 151 workspace tests pass. The shipped C `make` flow is unchanged.
 - Last updated: 2026-06-26.
 - User decisions captured:
   - The Rust rewrite may diverge permanently from upstream yabai. Rebaseability is no
@@ -48,6 +48,22 @@ reconstructing context.
     forcing literal Rust at the cost of fragile injection behavior.
 
 ## Progress log
+
+### 2026-06-27 (session 23) — `recent` selector (window + space)
+
+- Implemented the `recent` selector for windows and spaces. `AppState` now tracks
+  `last_focused_window` / `last_active_space` (the window/space focused immediately
+  before the current one), mirroring the C `last_window_id` / `last_space_id`.
+  `set_focused_window` and `set_active_space` record the previous value on a real
+  change; `resolve_window` resolves `recent` to `last_focused_window` (not
+  tree-scoped — the recent window may be on another space) and
+  `resolve_space_selector` resolves it to `last_active_space`.
+- Routed the live focus paths through the setters so `recent` tracks correctly:
+  `StateEvent::WindowFocused` (AX observer) and the command focus / leading-target
+  paths in `dispatch_window` now go through `set_focused_window`.
+- Added pure tests for both (`window --focus recent` resolves the prior focus;
+  `--space recent` resolves the prior active space). 151 tests; fmt/clippy clean;
+  release builds.
 
 ### 2026-06-27 (session 22) — space labels
 
@@ -1712,4 +1728,6 @@ deminimize/title-change events and app/title filters for metadata-carrying event
 - Deferred in the pure layer (need live state): zoom persistence, insert
   feedback, the z-order rank tie-break in `find_node_in_direction`, cross-space
   warp/swap and the `:NaturalWarp` heuristic (single-space `warp_window` is
-  done), and `recent`/`mouse`/`stack[.N]`/label selector resolution.
+  done), and `mouse`/`stack[.N]` selector resolution. DONE since: `recent`
+  (window + space, via `last_focused_window`/`last_active_space`) and space
+  `label` selectors.

@@ -100,6 +100,10 @@ pub struct AppState {
     spaces: HashMap<u64, Tree>,
     active_space: Option<u64>,
     focused_window: Option<u32>,
+    /// The window/space focused immediately before the current one, for the
+    /// `recent` selector (mirrors the C `last_window_id` / `last_space_id`).
+    last_focused_window: Option<u32>,
+    last_active_space: Option<u64>,
     window_meta: HashMap<u32, WindowMeta>,
     window_spaces: HashMap<u32, u64>,
     /// Windows the user floated (`window --toggle float`): kept out of every tree
@@ -310,6 +314,11 @@ impl AppState {
     }
 
     pub fn set_active_space(&mut self, sid: u64) {
+        if self.active_space != Some(sid) {
+            if let Some(prev) = self.active_space {
+                self.last_active_space = Some(prev);
+            }
+        }
         self.active_space = Some(sid);
     }
 
@@ -328,6 +337,11 @@ impl AppState {
     }
 
     pub fn set_focused_window(&mut self, window_id: Option<u32>) {
+        if window_id.is_some() && window_id != self.focused_window {
+            if let Some(prev) = self.focused_window {
+                self.last_focused_window = Some(prev);
+            }
+        }
         self.focused_window = window_id;
     }
 
@@ -574,7 +588,8 @@ impl AppState {
                 }
             }
             StateEvent::WindowFocused { window_id } => {
-                self.focused_window = Some(window_id);
+                // Through the setter so the `recent` selector tracks live focus.
+                self.set_focused_window(Some(window_id));
             }
             StateEvent::SpaceCreated { sid, frame } => self.add_space(sid, frame),
             StateEvent::SpaceCreatedOnDisplay {
@@ -635,13 +650,15 @@ impl AppState {
 
     fn dispatch_window(&mut self, target: Option<&Selector>, actions: &[WindowAction]) -> Response {
         if let Some(target) = target {
-            self.focused_window = Some(self.resolve_window(target)?);
+            let resolved = self.resolve_window(target)?;
+            self.set_focused_window(Some(resolved));
         }
         for action in actions {
             match action {
                 WindowAction::Focus(sel) => {
                     if let Some(sel) = sel {
-                        self.focused_window = Some(self.resolve_window(sel)?);
+                        let resolved = self.resolve_window(sel)?;
+                        self.set_focused_window(Some(resolved));
                     }
                 }
                 WindowAction::Swap(sel) => {
@@ -1587,6 +1604,9 @@ impl AppState {
                 .iter()
                 .find_map(|(&sid, existing)| (existing == label).then_some(sid))
                 .ok_or_else(|| format!("could not locate space with label '{label}'.\n")),
+            Some(Selector::Recent) => self
+                .last_active_space
+                .ok_or_else(|| "could not locate the recent space.\n".to_string()),
             Some(selector) => Err(format!(
                 "selector {selector:?} cannot be resolved without live space state"
             )),
@@ -1603,13 +1623,19 @@ impl AppState {
 
     /// Resolve a window selector against the active space's layout tree.
     ///
-    /// Resolved here: a numeric id, `first`/`last` (by tree order), `next`/`prev`
+    /// Resolved here: a numeric id, `recent` (the previously focused window, which
+    /// may be on another space), `first`/`last` (by tree order), `next`/`prev`
     /// (relative to the focused window in tree order, no wrap), and a cardinal
-    /// direction (the top window of the neighboring node). `recent`, `mouse`,
-    /// `stack[.N]`, and labels still need live state and are reported.
+    /// direction (the top window of the neighboring node). `mouse`, `stack[.N]`,
+    /// and labels still need live state and are reported.
     fn resolve_window(&self, selector: &Selector) -> Result<u32, String> {
         if let Selector::Index(id) = selector {
             return Ok(*id);
+        }
+        if let Selector::Recent = selector {
+            return self
+                .last_focused_window
+                .ok_or_else(|| "could not locate the recent window.\n".to_string());
         }
 
         let sid = self
@@ -2458,6 +2484,34 @@ mod tests {
             Ok(Some(
                 "{\n\t\"id\":1,\n\t\"type\":\"bsp\",\n\t\"windows\":[1, 2],\n\t\"first-window\":1,\n\t\"last-window\":2,\n\t\"has-focus\":true,\n\t\"is-visible\":true\n}\n".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn recent_window_selector_resolves_previous_focus() {
+        let mut state = state_with_space();
+        state.add_window(1).unwrap();
+        state.add_window(2).unwrap();
+        state.set_focused_window(Some(1));
+        state.set_focused_window(Some(2));
+
+        // `recent` is the window focused before the current one (1).
+        assert_eq!(
+            state.handle_tokens(&toks(&["window", "--focus", "recent"])),
+            Ok(None)
+        );
+        assert_eq!(state.focused_window_id(), Some(1));
+    }
+
+    #[test]
+    fn recent_space_selector_resolves_previous_active() {
+        let mut state = state_with_displays();
+        state.set_active_space(1);
+        state.set_active_space(2);
+
+        assert_eq!(
+            state.handle_tokens(&toks(&["query", "--spaces", "id", "--space", "recent"])),
+            Ok(Some("{\n\t\"id\":1\n}\n".to_string()))
         );
     }
 
