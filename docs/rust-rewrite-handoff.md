@@ -24,12 +24,15 @@ reconstructing context.
   is modeled and executed: `signal --add/--list/--remove` plus live firing of
   `window_created`, `window_destroyed`, `window_focused`, `window_moved`,
   `window_resized`, `window_minimized`, `window_deminimized`,
-  `window_title_changed`, `application_launched/terminated`, and `space_changed`
-  actions, plus `application_activated`, `application_deactivated`,
-  `application_hidden`, and `application_visible` (NSWorkspace-driven), with
-  `app`/`title` regex filters now honored for the event categories that carry
-  that metadata and the `active` (front-app) context for the hidden/terminated
-  categories. `mouse_follows_focus` warps the cursor to the focused window on
+  `window_title_changed`, `application_launched/terminated`, `space_changed`,
+  `application_activated/deactivated/hidden/visible`, `application_front_switched`,
+  `display_changed`, `display_added/removed`, `system_woke`,
+  `menu_bar_hidden_changed`, and `dock_did_change_pref` actions, with `app`/`title`
+  regex filters honored for the metadata-carrying categories and the `active`
+  (front-app) context for the hidden/terminated categories. NSWorkspace
+  notifications are now actually delivered (fixed via `NSApplicationLoad` plus
+  running the AppKit run loop on the daemon's main thread, with the event loop on a
+  worker thread). `mouse_follows_focus` warps the cursor to the focused window on
   focus.
   The `rule` domain is modeled and executed for stored rules, list/remove/apply,
   one-shot removal, regex matching, and the live `manage` effect (`manage=off`
