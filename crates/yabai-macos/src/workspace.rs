@@ -70,6 +70,11 @@ pub enum WorkspaceEvent {
     ApplicationDeactivated { pid: i32, app: String },
     ApplicationHidden { pid: i32, app: String },
     ApplicationVisible { pid: i32, app: String },
+    DisplayChanged,
+    SystemWoke,
+    DockDidRestart,
+    DockDidChangePref,
+    MenuBarHiddenChanged,
 }
 
 fn send_workspace_event(event: WorkspaceEvent) {
@@ -171,6 +176,26 @@ extern "C" fn application_did_unhide(_this: Id, _cmd: Sel, notification: Id) {
     }
 }
 
+extern "C" fn active_display_did_change(_this: Id, _cmd: Sel, _notification: Id) {
+    send_workspace_event(WorkspaceEvent::DisplayChanged);
+}
+
+extern "C" fn did_wake(_this: Id, _cmd: Sel, _notification: Id) {
+    send_workspace_event(WorkspaceEvent::SystemWoke);
+}
+
+extern "C" fn did_restart_dock(_this: Id, _cmd: Sel, _notification: Id) {
+    send_workspace_event(WorkspaceEvent::DockDidRestart);
+}
+
+extern "C" fn did_change_dock_pref(_this: Id, _cmd: Sel, _notification: Id) {
+    send_workspace_event(WorkspaceEvent::DockDidChangePref);
+}
+
+extern "C" fn did_change_menu_bar_hiding(_this: Id, _cmd: Sel, _notification: Id) {
+    send_workspace_event(WorkspaceEvent::MenuBarHiddenChanged);
+}
+
 fn add_observer_method(cls: Class, name: Sel, method: extern "C" fn(Id, Sel, Id)) -> bool {
     // SAFETY: `cls` is being configured before registration. All observer
     // methods take one object argument and return void (`v@:@`), matching
@@ -226,6 +251,29 @@ fn workspace_observer_class() -> Option<Class> {
                 return;
             }
             if !add_observer_method(cls, sel(c"applicationDidUnhide:"), application_did_unhide) {
+                return;
+            }
+            if !add_observer_method(
+                cls,
+                sel(c"activeDisplayDidChange:"),
+                active_display_did_change,
+            ) {
+                return;
+            }
+            if !add_observer_method(cls, sel(c"didWake:"), did_wake) {
+                return;
+            }
+            if !add_observer_method(cls, sel(c"didRestartDock:"), did_restart_dock) {
+                return;
+            }
+            if !add_observer_method(cls, sel(c"didChangeDockPref:"), did_change_dock_pref) {
+                return;
+            }
+            if !add_observer_method(
+                cls,
+                sel(c"didChangeMenuBarHiding:"),
+                did_change_menu_bar_hiding,
+            ) {
                 return;
             }
             // SAFETY: `cls` has been fully configured and can now be registered.
@@ -380,6 +428,52 @@ pub fn observe_workspace(tx: Sender<WorkspaceEvent>) -> Result<(), String> {
             sel(c"applicationDidUnhide:"),
             b"NSWorkspaceDidUnhideApplicationNotification\0",
         )?;
+        add_workspace_observer(
+            center,
+            observer,
+            sel(c"activeDisplayDidChange:"),
+            b"NSWorkspaceActiveDisplayDidChangeNotification\0",
+        )?;
+        add_workspace_observer(
+            center,
+            observer,
+            sel(c"didWake:"),
+            b"NSWorkspaceDidWakeNotification\0",
+        )?;
+
+        // The Dock-restart notification is on the regular default center, and the
+        // Dock-pref / menu-bar-hiding notifications are distributed, per the C
+        // daemon's `workspace_context` setup.
+        let default_center_class = class(c"NSNotificationCenter");
+        if !default_center_class.is_null() {
+            let default_center: Id = msg0(default_center_class, sel(c"defaultCenter"));
+            if !default_center.is_null() {
+                add_workspace_observer(
+                    default_center,
+                    observer,
+                    sel(c"didRestartDock:"),
+                    b"NSApplicationDockDidRestartNotification\0",
+                )?;
+            }
+        }
+        let distributed_center_class = class(c"NSDistributedNotificationCenter");
+        if !distributed_center_class.is_null() {
+            let distributed_center: Id = msg0(distributed_center_class, sel(c"defaultCenter"));
+            if !distributed_center.is_null() {
+                add_workspace_observer(
+                    distributed_center,
+                    observer,
+                    sel(c"didChangeMenuBarHiding:"),
+                    b"AppleInterfaceMenuBarHidingChangedNotification\0",
+                )?;
+                add_workspace_observer(
+                    distributed_center,
+                    observer,
+                    sel(c"didChangeDockPref:"),
+                    b"com.apple.dock.prefchanged\0",
+                )?;
+            }
+        }
 
         CFRunLoopRun();
     }

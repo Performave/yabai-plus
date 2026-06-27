@@ -1810,6 +1810,39 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                             drop_pid(&mut runtime, &mut managed, &mut signaled, pid);
                         }
                     }
+                    // Context-free, always-fire signals (no YABAI_* env vars, no
+                    // app/title/active filtering — the C event filter never rejects
+                    // these). Mirrors the C `workspace_context` notification set.
+                    WorkspaceEvent::DisplayChanged => {
+                        refresh_live_display_state(&mut runtime, &mut display_frames);
+                        fire_signals(&runtime, SignalEvent::DisplayChanged, &[], None, None, None);
+                    }
+                    WorkspaceEvent::SystemWoke => {
+                        fire_signals(&runtime, SignalEvent::SystemWoke, &[], None, None, None);
+                    }
+                    WorkspaceEvent::DockDidRestart => {
+                        fire_signals(&runtime, SignalEvent::DockDidRestart, &[], None, None, None);
+                    }
+                    WorkspaceEvent::DockDidChangePref => {
+                        fire_signals(
+                            &runtime,
+                            SignalEvent::DockDidChangePref,
+                            &[],
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                    WorkspaceEvent::MenuBarHiddenChanged => {
+                        fire_signals(
+                            &runtime,
+                            SignalEvent::MenuBarHiddenChanged,
+                            &[],
+                            None,
+                            None,
+                            None,
+                        );
+                    }
                 },
                 WmWork::Tick => {
                     refresh_live_display_state(&mut runtime, &mut display_frames);

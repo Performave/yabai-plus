@@ -46,6 +46,37 @@ reconstructing context.
 
 ## Progress log
 
+### 2026-06-26 (session 20) — system/display/dock/menu-bar signals
+
+- Wired the remaining notification-driven signal categories that mirror the C
+  `workspace_context` setup, all context-free (no `YABAI_*` env vars, unfiltered —
+  the C `event_signal_filter` never rejects them):
+  - `display_changed` (`NSWorkspaceActiveDisplayDidChangeNotification`, also
+    refreshes live display state) and `system_woke` (`NSWorkspaceDidWakeNotification`)
+    on the NSWorkspace notification center;
+  - `dock_did_restart` (`NSApplicationDockDidRestartNotification`) on the default
+    `NSNotificationCenter`;
+  - `menu_bar_hidden_changed` (`AppleInterfaceMenuBarHidingChangedNotification`)
+    and `dock_did_change_pref` (`com.apple.dock.prefchanged`) on
+    `NSDistributedNotificationCenter`.
+  Added five `WorkspaceEvent` variants + callbacks + registrations in
+  `yabai-macos::workspace`, and the daemon arms that fire each signal.
+- Live verification (GUI `gui/501` LaunchAgent daemon): toggling "automatically
+  hide menu bar" on/off via System Events fired `menu_bar_hidden_changed` exactly
+  twice — confirming the **distributed** notification-center path (so
+  `dock_did_change_pref`, same center, is covered by the same mechanism).
+  `display_changed`/`system_woke` use the already-verified NSWorkspace center.
+- KNOWN GAP: `dock_did_restart` did **not** fire on `killall Dock`. It is an
+  AppKit-internal notification posted to the local default center, and detecting
+  the Dock restart appears to require the full `[NSApp run]` AppKit event loop;
+  the Rust daemon runs a plain `CFRunLoopRun` on the main thread (which is enough
+  for NSWorkspace + distributed notifications but not this AppKit-internal one).
+  Left wired but documented as unverified — switching to `[NSApp run]` is risky
+  (could disturb the now-working NSWorkspace delivery) and `dock_did_restart` is
+  low value, so deferred.
+- Verification: `cargo fmt --all`; `cargo test --workspace` (146 tests);
+  `cargo clippy --workspace --all-targets`; `cargo build --release -p yabai`.
+
 ### 2026-06-26 (session 19) — application_front_switched signal
 
 - The Rust WM daemon now fires `application_front_switched` when the frontmost app
@@ -1566,8 +1597,13 @@ deminimize/title-change events and app/title filters for metadata-carrying event
    `window_deminimized`, `window_title_changed`, `application_activated`,
    `application_deactivated`, `application_hidden`, `application_visible`, and
    `application_front_switched` (with `YABAI_*` env vars, incl.
-   `YABAI_RECENT_PROCESS_ID`). Still to do: the space/display/Mission Control/
-   system event categories.
+   `YABAI_RECENT_PROCESS_ID`), plus the context-free `space_changed`,
+   `display_changed`, `system_woke`, `menu_bar_hidden_changed`, and
+   `dock_did_change_pref` (`dock_did_restart` is wired but unverified — likely
+   needs `[NSApp run]`; see session 20). Still to do: `space_created`/
+   `space_destroyed`, `display_added`/`removed`/`moved`/`resized` (the daemon
+   already polls display topology — these could fire from that diff), and
+   `mission_control_enter`/`exit` (need SLS/private notifications).
    The NSWorkspace-driven application signals (launch/terminate/activate/
    deactivate/hide/visible) and app filters are now verified live from a
    `gui/501` LaunchAgent daemon — see session 17, which also fixed the long-
