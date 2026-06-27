@@ -25,7 +25,7 @@ use yabai_macos::{
 use yabai_runtime::{
     Actor, AppState, LayoutSink, RecordingSink, Response, Runtime, StateEvent, WindowMeta,
 };
-use yabai_sa::ScriptingAdditionStatus;
+use yabai_sa::{ScriptingAddition, ScriptingAdditionStatus};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -64,6 +64,8 @@ fn main() -> ExitCode {
         },
         Some("--experimental-sa-status") => run_sa_status(),
         Some("--experimental-sa-opacity") => run_sa_opacity(&args[1..]),
+        Some("--experimental-sa-create-space") => run_sa_space(&args[1..], true),
+        Some("--experimental-sa-destroy-space") => run_sa_space(&args[1..], false),
         _ => {
             eprintln!("yabai-rust: daemon skeleton is not implemented yet");
             ExitCode::from(64)
@@ -875,6 +877,37 @@ fn run_sa_opacity(args: &[String]) -> ExitCode {
     }
 }
 
+/// Direct probe of the space create/destroy SA opcodes against the live payload.
+/// Usage: `--experimental-sa-create-space <relative_sid>` /
+/// `--experimental-sa-destroy-space <sid>`.
+fn run_sa_space(args: &[String], create: bool) -> ExitCode {
+    let Some(sid) = args.first().and_then(|a| a.parse::<u64>().ok()) else {
+        eprintln!("usage: --experimental-sa-{{create,destroy}}-space <sid>");
+        return ExitCode::from(64);
+    };
+    let Ok(user) = std::env::var("USER") else {
+        eprintln!("scripting-addition: 'env USER' not set");
+        return ExitCode::from(1);
+    };
+    let sa = yabai_sa::ScriptingAddition::for_user(&user);
+    let result = if create {
+        sa.create_space(sid)
+    } else {
+        sa.destroy_space(sid)
+    };
+    let verb = if create { "create" } else { "destroy" };
+    match result {
+        Ok(()) => {
+            println!("scripting-addition: {verb} space request sent (sid {sid})");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("scripting-addition: {verb} space failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn run_space_probe(args: &[String]) -> ExitCode {
     let displays = match active_displays() {
         Ok(displays) => displays,
@@ -1165,6 +1198,53 @@ fn try_window_native_fullscreen_exit(
 /// (including a `--focus` mixed with other actions) returns `None` so the caller
 /// dispatches it through the pure core. Mirrors `space_manager_focus_space`'s
 /// gesture fallback; the scripting-addition path is deferred (Phase 8).
+/// Intercept the `space` commands that require the scripting addition
+/// (`--create`, `--destroy`). Returns `None` for any other command so the normal
+/// dispatch chain handles it. On success it refreshes live display state so the
+/// new/removed space is reflected immediately rather than waiting for the tick.
+fn try_scripting_addition(
+    sa: &ScriptingAddition,
+    runtime: &mut Runtime<AxSink>,
+    display_frames: &mut Vec<(u32, Area)>,
+    tokens: &[String],
+) -> Option<Response> {
+    let Ok(Message::Space(cmd)) = parse_message(tokens) else {
+        return None;
+    };
+    for action in &cmd.actions {
+        let result = match action {
+            SpaceAction::Create => {
+                // Create a space on the display of the acting (target/active) space,
+                // mirroring the C `space --create`.
+                match runtime.state.resolve_space(cmd.target.as_ref()) {
+                    Ok(sid) => sa
+                        .create_space(sid)
+                        .map(|()| None)
+                        .map_err(|error| format!("could not create space: {error}\n")),
+                    Err(error) => Err(error),
+                }
+            }
+            SpaceAction::Destroy(selector) => {
+                let selector = selector.as_ref().or(cmd.target.as_ref());
+                match runtime.state.resolve_space(selector) {
+                    Ok(sid) => sa
+                        .destroy_space(sid)
+                        .map(|()| None)
+                        .map_err(|error| format!("could not destroy space: {error}\n")),
+                    Err(error) => Err(error),
+                }
+            }
+            _ => continue,
+        };
+        if result.is_ok() {
+            // Pick up the new/removed space (and its tree) right away.
+            refresh_live_display_state(runtime, display_frames);
+        }
+        return Some(result);
+    }
+    None
+}
+
 fn try_space_focus(
     runtime: &mut Runtime<AxSink>,
     display_frames: &[(u32, Area)],
@@ -1682,6 +1762,21 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
     // as `YABAI_RECENT_PROCESS_ID` for application_front_switched.
     let mut front_pid: Option<i32> = None;
 
+    // Scripting-addition client for privileged ops the AX API cannot do (space
+    // create/destroy/move, etc.). Built from the daemon's real login user, not the
+    // per-command USER override the IPC client uses. Calls fail gracefully when the
+    // SA payload is not loaded.
+    let scripting_addition =
+        ScriptingAddition::for_user(&std::env::var("USER").unwrap_or_default());
+    match scripting_addition.status() {
+        ScriptingAdditionStatus::Healthy { payload_version } => eprintln!(
+            "yabai-rust: scripting addition available (payload v{payload_version}) — space create/destroy enabled"
+        ),
+        other => eprintln!(
+            "yabai-rust: scripting addition not usable ({other:?}); space create/destroy will fail until it is loaded"
+        ),
+    }
+
     // Unified event loop: observers, the periodic tick, and the socket all feed
     // one channel processed against the single `Runtime<AxSink>`.
     let (tx, rx) = channel::<WmWork>();
@@ -1990,9 +2085,19 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                             &tokens,
                         ) {
                             Some(response) => response,
-                            None => match try_space_focus(&mut runtime, &display_frames, &tokens) {
+                            None => match try_scripting_addition(
+                                &scripting_addition,
+                                &mut runtime,
+                                &mut display_frames,
+                                &tokens,
+                            ) {
                                 Some(response) => response,
-                                None => runtime.message(&tokens),
+                                None => {
+                                    match try_space_focus(&mut runtime, &display_frames, &tokens) {
+                                        Some(response) => response,
+                                        None => runtime.message(&tokens),
+                                    }
+                                }
                             },
                         },
                     };

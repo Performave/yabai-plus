@@ -315,6 +315,13 @@ impl AppState {
         self.display_spaces(display_id)
     }
 
+    /// Public space-selector resolution for daemon-side interception (e.g. the
+    /// scripting-addition `space --destroy/--move` paths). `None` resolves to the
+    /// active space.
+    pub fn resolve_space(&self, selector: Option<&Selector>) -> Result<u64, String> {
+        self.resolve_space_selector(selector)
+    }
+
     pub fn window_space_id(&self, window_id: u32) -> Option<u64> {
         self.window_space(window_id)
     }

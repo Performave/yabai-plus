@@ -49,6 +49,31 @@ reconstructing context.
 
 ## Progress log
 
+### 2026-06-27 (session 27) — SA space create/destroy wired + verified live
+
+- Wired the scripting addition into the WM daemon for the headline feature: space
+  management. `try_scripting_addition` intercepts `space --create` / `space
+  --destroy` before the normal dispatch chain, resolves the acting space sid
+  (`AppState::resolve_space`, newly public), calls
+  `ScriptingAddition::create_space` / `destroy_space`, and refreshes live display
+  state so the new/removed space (and its tree) is reflected immediately. The
+  daemon builds one `ScriptingAddition` from its real login `USER` at startup and
+  logs whether the payload is healthy.
+- **Verified live against the real injected payload** via two direct probes
+  (`--experimental-sa-create-space <sid>` / `--experimental-sa-destroy-space
+  <sid>`): a net-zero round-trip on this machine — spaces `[22,156,8,334]`,
+  `create-space 22` added sid `354` on the same display
+  (`[22,156,8,354,334]`), then `destroy-space 354` restored `[22,156,8,334]`.
+  This is the first time the Rust port has created/destroyed real macOS spaces —
+  the single biggest functional gap, now closed for create/destroy.
+- Still to wire through the daemon (client methods exist + proven): `space --move`
+  / `--display` (cross-display), `window --display`/`--space` (move window to
+  space/display), and window `opacity`/`layer`/`sticky`/`shadow` (sticky/shadow
+  need toggle-state tracking). `space --focus` still uses the gesture path; it
+  could switch to the SA `focus_space` opcode now that the SA is available.
+- Verification: `cargo fmt --all`; `cargo test --workspace` (158 tests);
+  `cargo clippy --workspace --all-targets`; `cargo build --release -p yabai`.
+
 ### 2026-06-27 (session 26) — Phase 7 start: scripting-addition runtime client
 
 - Started Phase 7 with the highest-leverage piece: the **runtime client** that the
