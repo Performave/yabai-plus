@@ -49,6 +49,60 @@ reconstructing context.
 
 ## Progress log
 
+### 2026-06-27 (session 29) — `space --focus` uses SA `focus_space` (gesture fallback) + SA installed on remote
+
+- Switched `space --focus <sel>` from the gesture-only path to **SA `focus_space`
+  first, gesture fallback**, mirroring the C `space_manager_focus_space` (which
+  always uses the SA when loaded). `try_space_focus` now takes the daemon's
+  `ScriptingAddition`; on a focus it calls `sa.focus_space(target)` and, on
+  success, activates the destination display if it differs from the cursor's
+  (`activate_space_display_if_cross`, mirroring the C
+  `display_manager_focus_display` / the gesture path's `focus_display` branch).
+  Any SA error (incl. SA not loaded) falls back to `focus_space_by_gesture`. The
+  daemon logs which path ran (`via scripting addition` / `via gesture`).
+- **Bounce-back guard tried and removed.** First cut gated the SA path on the
+  destination having a managed window (the C yabai-plus drops the front process to
+  Finder after an SA focus of an empty same-display space to stop macOS bouncing
+  back). Two findings on the remote killed that gate: (1) per-space window
+  tracking is unreliable for *non-current* spaces on macOS 26 — `spaces_for_window`
+  reports windows on the current space only, so the daemon's tree for any
+  destination looks empty and the gate made the SA path **unreachable**; (2) the
+  bounce-back **does not reproduce** with this standalone daemon (SA-focusing an
+  empty space with another app frontmost stayed put). So the SA path is now taken
+  unconditionally when the SA is loaded; the Finder-drop is deferred (needs
+  process-manager state) and only revisited if the bounce-back actually surfaces.
+- Added `--experimental-sa-focus-space <sid>` (direct opcode probe) — the SA
+  `focus_space` opcode had never been exercised before (sessions 26–27 proved
+  create/destroy/window-to-space/opacity).
+- **Installed this fork's scripting addition on the remote MacBook Air so the SA
+  path is testable there.** The box (macOS 26.5.1, arm64) was already SIP-prepped
+  (Filesystem/Debugging/NVRAM/Boot-arg protections off, `boot-args
+  -arm64e_preview_abi` set) and the fork's payload supports macOS 26 (Tahoe).
+  Deployed the built C `bin/yabai` (`/tmp/yabai-c`, v7.1.25-plus, matching SA
+  v2.1.30); the user ran `sudo /tmp/yabai-c --install-sudoers` once (one password)
+  to write the passwordless `--load-sa` sudoers rule, after which `sudo -n
+  /tmp/yabai-c --load-sa` (+ a `killall Dock`) injected the SA — `--check-sa` and
+  the Rust `--experimental-sa-status` both report `loaded and healthy (payload
+  v2.1.30)`. Only the SA is loaded; the C daemon/service is NOT running, so
+  nothing fights the Rust WM daemon.
+- **Verified end-to-end on the remote.** Direct opcode: `--experimental-sa-focus-space`
+  switched sid 1↔18 instantly. Through the WM daemon: `space --focus 2`/`3`
+  switched to sid 18 / 36 with the log confirming **`focused space N via scripting
+  addition`**; `space --focus 1` while on 1 returned the correct "cannot focus an
+  already focused space". Gesture fallback was separately confirmed before the SA
+  was loaded (`via gesture`, sid 1↔18). IMPORTANT: do NOT test mutating SA opcodes
+  on the user's live machine — use the remote box (see the new memory + runbook).
+- Still to wire through the daemon (client methods exist + proven): `space
+  --move` / `--display` (cross-display space moves), `window --display` (move
+  window to a display), and window `layer`/`sticky`/`shadow` (need toggle-state
+  tracking; `--layer` is not in the parser grammar yet).
+- Known macOS-26 daemon issue surfaced here (separate from this feature):
+  `spaces_for_window` (SkyLight `SLSCopySpacesForWindows`) returns only the
+  current space, so the daemon mis-assigns windows on non-current spaces to the
+  active space. Worth fixing for multi-space tiling on macOS 26.
+- Verification: `cargo fmt --all`; `cargo test --workspace` (158 tests);
+  `cargo clippy --workspace --all-targets`; `cargo build --release -p yabai`.
+
 ### 2026-06-27 (session 28) — SA window opacity wired into daemon + verified live
 
 - Wired `window --opacity <float>` through the WM daemon via the scripting
@@ -1787,7 +1841,8 @@ windows-for-pid,pid-debug,move-focused,move-pid,tile-pid,observe-pid}`,
 `--experimental-cursor-location` (prints the live cursor point),
 `--experimental-window-alpha <wid>` (read-only `SLSGetWindowAlpha` opacity
 readback — verifies the SA opacity opcode), `--experimental-sa-{status,opacity,
-create-space,destroy-space,window-to-space}` (direct SA opcode probes),
+create-space,destroy-space,window-to-space,focus-space}` (direct SA opcode
+probes — do NOT run the mutating ones against the user's live machine),
 `--experimental-rust-{daemon,tile-daemon}` (the tile-daemon is the older
 snapshot-only `Actor<AxSink>` version; the wm-daemon supersedes it).
 
@@ -1808,10 +1863,20 @@ deminimize/title-change events and app/title filters for metadata-carrying event
 1. Multi-space + Mission Control: space discovery, startup per-space trees, and
    window-to-space assignment/routing now exist for the first display; space
    add/remove is refreshed by polling and active-space changes are notified.
-   `space --focus <sel>` now works (gesture-based, including cross-display cursor
-   warp/display activation). Still to do: `--switch`/`--move`/`--create`/
-   `--destroy`/`--swap`/`--display` (need the scripting addition, Phase 8), and,
-   later, SLS create/destroy notifications.
+   `space --focus <sel>` uses the SA `focus_space` opcode whenever the SA is
+   loaded (SA-first, unconditional), falling back to the dock-swipe gesture only
+   on SA error (incl. SA absent), with cross-display cursor warp/display
+   activation; `--create`/`--destroy` work via the SA (session 27). Still to do:
+   `--switch`/`--move`/`--swap`/`--display` (cross-display space moves need the SA
+   wired through; the client methods exist), and, later, SLS create/destroy
+   notifications.
+   **macOS-26 bug to fix (found session 29):** `yabai_macos::space::spaces_for_window`
+   (`SLSCopySpacesForWindows`) returns only the *current* space on macOS 26, so
+   the daemon mis-assigns windows on non-current spaces to the active space — per-
+   space trees for non-visible spaces look empty. This breaks multi-space tiling
+   on macOS 26 and was the reason the first `space --focus` design (gate the SA
+   path on "destination has a managed window") was wrong and got removed. Fix the
+   window→space resolution before relying on per-space trees on macOS 26.
 2. Multi-display: done — the daemon tiles every display's current space at once,
    each in its own usable frame, routing windows to the display they're on.
    Display hot-plug is handled by polling/reconcile before daemon work and on the
@@ -1865,13 +1930,25 @@ deminimize/title-change events and app/title filters for metadata-carrying event
   `target/debug/yabai`. The Rust binary is a client + experimental daemons only;
   it is not wired into `make`/signing/launchd and must not replace the C daemon.
 - The user runs the C yabai live. Read-only `query` via the Rust client is safe;
-  never bind `/tmp/yabai_$USER.socket` from Rust. The WM-daemon live tests run
-  with the C service stopped so nothing fights the tiling.
+  never bind `/tmp/yabai_$USER.socket` from Rust.
+- **Do all live/mutating macOS testing on the REMOTE box, never on the user's
+  local machine.** Anything that changes on-screen state (space focus/create/
+  destroy, window moves/opacity/tiling) flips the user's live session — they
+  reacted strongly to local space-switching. Read-only checks (cargo, `query`)
+  are fine locally. The remote (`ssh student@student`, uid 501; see
+  `REMOTE_TESTING.local.md`) now has **this fork's SA installed** (session 29):
+  C binary `/tmp/yabai-c` (v7.1.25-plus, SA v2.1.30, macOS-26 capable) with a
+  passwordless `--load-sa` sudoers rule — reload after a Dock restart via `ssh
+  student@student 'sudo -n /tmp/yabai-c --load-sa'`, verify with `/tmp/yabai-rust
+  --experimental-sa-status`. Only the SA is loaded there (no C daemon), so it
+  won't fight the Rust WM daemon. Re-grant Accessibility in the USER TCC db after
+  every re-sign of `/tmp/yabai-rust` (else AX reads fail with an "Accessibility
+  Access" prompt and window discovery returns nothing).
 - Workspace lints deny `clippy::undocumented_unsafe_blocks` — every `unsafe`
   block needs a `// SAFETY:` comment. `cargo fmt` reorders `use` lists
   (types/fns interleaved alphabetically); let it, then match its output.
 - Verify each step with `cargo fmt --all && cargo clippy --workspace
-  --all-targets && cargo test --workspace`. Currently 145 tests, clippy clean.
+  --all-targets && cargo test --workspace`. Currently 158 tests, clippy clean.
 - The live WM daemon binds only a caller-supplied socket; to message it use a
   socket named `/tmp/yabai_<name>.socket` and query with `USER=<name>`. Always
   `pkill -f experimental-rust-wm-daemon` to stop it (each shell call is a fresh

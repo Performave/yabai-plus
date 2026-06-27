@@ -67,6 +67,7 @@ fn main() -> ExitCode {
         Some("--experimental-sa-create-space") => run_sa_space(&args[1..], true),
         Some("--experimental-sa-destroy-space") => run_sa_space(&args[1..], false),
         Some("--experimental-sa-window-to-space") => run_sa_window_to_space(&args[1..]),
+        Some("--experimental-sa-focus-space") => run_sa_focus_space(&args[1..]),
         Some("--experimental-window-alpha") => run_window_alpha(&args[1..]),
         _ => {
             eprintln!("yabai-rust: daemon skeleton is not implemented yet");
@@ -936,6 +937,30 @@ fn run_sa_window_to_space(args: &[String]) -> ExitCode {
     }
 }
 
+/// Direct probe of the focus-space SA opcode against the live payload. Switches
+/// Mission Control to `<sid>` instantly (no gesture). Reversible: re-run with the
+/// previous sid. Usage: `--experimental-sa-focus-space <sid>`.
+fn run_sa_focus_space(args: &[String]) -> ExitCode {
+    let Some(sid) = args.first().and_then(|a| a.parse::<u64>().ok()) else {
+        eprintln!("usage: --experimental-sa-focus-space <sid>");
+        return ExitCode::from(64);
+    };
+    let Ok(user) = std::env::var("USER") else {
+        eprintln!("scripting-addition: 'env USER' not set");
+        return ExitCode::from(1);
+    };
+    match yabai_sa::ScriptingAddition::for_user(&user).focus_space(sid) {
+        Ok(()) => {
+            println!("scripting-addition: focused space {sid}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("scripting-addition: focus space failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 /// Read-only probe of a window's live alpha via SkyLight (`SLSGetWindowAlpha`).
 /// Used to verify the scripting-addition opacity opcode took effect, since the SA
 /// write itself only returns an ack byte. Usage: `--experimental-window-alpha <window_id>`.
@@ -1359,6 +1384,7 @@ fn window_opacity_via_sa(
 }
 
 fn try_space_focus(
+    sa: &ScriptingAddition,
     runtime: &mut Runtime<AxSink>,
     display_frames: &[(u32, Area)],
     tokens: &[String],
@@ -1388,13 +1414,61 @@ fn try_space_focus(
         return Some(Err("cannot focus an already focused space.".to_string()));
     }
 
-    if let Err(error) = focus_space_by_gesture(&spaces, active, target) {
-        return Some(Err(error));
+    // Prefer the scripting addition's instant `focus_space` opcode (mirroring the
+    // C `space_manager_focus_space`, which always uses the SA when it is loaded);
+    // fall back to the dock-swipe gesture only when the SA is unavailable or the
+    // opcode fails.
+    //
+    // NOTE: the C yabai-plus additionally drops the front process to Finder after
+    // an SA focus of an *empty* same-display space, to stop macOS bouncing back to
+    // the previous space (the previously frontmost app keeps its key window on the
+    // old space). That needs process-manager state this daemon does not model yet;
+    // the bounce-back has not reproduced with this standalone daemon (verified on
+    // macOS 26: SA-focusing an empty space with another app frontmost stayed put),
+    // so it is deferred — add the Finder-drop if it surfaces. We deliberately do
+    // NOT gate the SA path on the destination having a managed window: per-space
+    // window tracking is unreliable for non-current spaces on macOS 26, so such a
+    // gate would make the SA path unreachable.
+    let mut used_scripting_addition = false;
+    match sa.focus_space(target) {
+        Ok(()) => {
+            if let Err(error) = activate_space_display_if_cross(target) {
+                return Some(Err(error));
+            }
+            eprintln!("yabai-rust: focused space {target} via scripting addition");
+            used_scripting_addition = true;
+        }
+        Err(error) => {
+            eprintln!("yabai-rust: scripting-addition space focus failed ({error}); using gesture");
+        }
+    }
+
+    if !used_scripting_addition {
+        if let Err(error) = focus_space_by_gesture(&spaces, active, target) {
+            return Some(Err(error));
+        }
+        eprintln!("yabai-rust: focused space {target} via gesture");
     }
 
     refresh_all_active_spaces(runtime, display_frames);
     runtime.state.set_active_space(target);
     Some(Ok(None))
+}
+
+/// After a scripting-addition space focus, activate the destination display when
+/// it differs from the cursor's current display, mirroring the gesture path's
+/// `focus_display` branch and the C `display_manager_focus_display`. No-op on a
+/// single display (the cursor is already on the only display).
+fn activate_space_display_if_cross(target: u64) -> Result<(), String> {
+    let Ok(display_id) = display_for_space(target) else {
+        return Ok(());
+    };
+    let cross_display = cursor_display_id().map_or(true, |cursor| cursor != display_id);
+    if cross_display {
+        warp_cursor_to_display_center(display_id).map_err(|error| error.to_string())?;
+        set_active_display(display_id).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// Resolve a `space` selector to a concrete space id against the global,
@@ -2206,7 +2280,12 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                             ) {
                                 Some(response) => response,
                                 None => {
-                                    match try_space_focus(&mut runtime, &display_frames, &tokens) {
+                                    match try_space_focus(
+                                        &scripting_addition,
+                                        &mut runtime,
+                                        &display_frames,
+                                        &tokens,
+                                    ) {
                                         Some(response) => response,
                                         None => runtime.message(&tokens),
                                     }
