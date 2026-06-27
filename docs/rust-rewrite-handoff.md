@@ -46,6 +46,24 @@ reconstructing context.
 
 ## Progress log
 
+### 2026-06-26 (session 19) — application_front_switched signal
+
+- The Rust WM daemon now fires `application_front_switched` when the frontmost app
+  changes, driven by the NSWorkspace activate notification. It exports
+  `YABAI_PROCESS_ID` (the new front pid) and `YABAI_RECENT_PROCESS_ID` (the
+  previous front pid), mirroring the C process manager's
+  `g_process_manager.front_pid` / `last_front_pid`. The signal is unfiltered (the
+  C `event_signal_filter` falls to its `default: return false`, i.e. never filters
+  it out), matching the runtime's `_ => true` arm. Fired only on an actual front
+  change (`front_pid != Some(pid)`), just before `application_activated`.
+- Live verification on `ssh student@student` (GUI `gui/501` LaunchAgent daemon):
+  activating Calculator → TextEdit → Finder produced
+  `fsw:<calc>:recent:<calc>` (cold start, recent == self),
+  `fsw:<te>:recent:<calc>`, `fsw:<finder>:recent:<te>`, with the recent pid
+  correctly chaining each switch.
+- Verification: `cargo fmt --all`; `cargo test --workspace` (146 tests);
+  `cargo clippy --workspace --all-targets`; `cargo build --release -p yabai`.
+
 ### 2026-06-26 (session 18) — backport audit of C `master` fixes
 
 Audited the 9 commits on `master` (the C codebase) that postdate the rust-port
@@ -1546,10 +1564,10 @@ deminimize/title-change events and app/title filters for metadata-carrying event
    `window_destroyed`, `window_focused`, `application_launched/terminated`,
    `space_changed`, `window_moved`, `window_resized`, `window_minimized`,
    `window_deminimized`, `window_title_changed`, `application_activated`,
-   `application_deactivated`, `application_hidden`, and `application_visible`
-   (with `YABAI_*` env vars). Still to do: `application_front_switched` (needs
-   front/last-front pid tracking with `YABAI_RECENT_PROCESS_ID`), the
-   space/display/Mission Control/system event categories.
+   `application_deactivated`, `application_hidden`, `application_visible`, and
+   `application_front_switched` (with `YABAI_*` env vars, incl.
+   `YABAI_RECENT_PROCESS_ID`). Still to do: the space/display/Mission Control/
+   system event categories.
    The NSWorkspace-driven application signals (launch/terminate/activate/
    deactivate/hide/visible) and app filters are now verified live from a
    `gui/501` LaunchAgent daemon — see session 17, which also fixed the long-

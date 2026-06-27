@@ -1576,7 +1576,8 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
     // real focus change whether the change came from a command or an AX observer.
     let mut last_focus_signal: Option<u32> = None;
     // The front (active) app pid, tracked from NSWorkspace activate notifications.
-    // Used as the `active` context for application_hidden/terminated signals.
+    // Used as the `active` context for application_hidden/terminated signals and
+    // as `YABAI_RECENT_PROCESS_ID` for application_front_switched.
     let mut front_pid: Option<i32> = None;
 
     // Unified event loop: observers, the periodic tick, and the socket all feed
@@ -1714,6 +1715,25 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                         }
                     }
                     WorkspaceEvent::ApplicationActivated { pid, app } => {
+                        // The frontmost app changed: fire front_switched with the
+                        // new and previous front pids, mirroring the C process
+                        // manager (YABAI_PROCESS_ID = front, YABAI_RECENT_PROCESS_ID
+                        // = last front). front_switched is unfiltered in the C
+                        // event filter.
+                        if front_pid != Some(pid) {
+                            let recent = front_pid.unwrap_or(pid);
+                            fire_signals(
+                                &runtime,
+                                SignalEvent::ApplicationFrontSwitched,
+                                &[
+                                    ("YABAI_PROCESS_ID", pid.to_string()),
+                                    ("YABAI_RECENT_PROCESS_ID", recent.to_string()),
+                                ],
+                                None,
+                                None,
+                                None,
+                            );
+                        }
                         front_pid = Some(pid);
                         fire_signals(
                             &runtime,
