@@ -37,7 +37,7 @@ reconstructing context.
   The `rule` domain is modeled and executed for stored rules, list/remove/apply,
   one-shot removal, regex matching, and the live `manage` effect (`manage=off`
   floats/untiles, `manage=on` retiles); other rule effects are parsed/stored but
-  deferred. 146 workspace tests pass. The shipped C `make` flow is unchanged.
+  deferred. 147 workspace tests pass. The shipped C `make` flow is unchanged.
 - Last updated: 2026-06-26.
 - User decisions captured:
   - The Rust rewrite may diverge permanently from upstream yabai. Rebaseability is no
@@ -48,6 +48,30 @@ reconstructing context.
     forcing literal Rust at the cost of fragile injection behavior.
 
 ## Progress log
+
+### 2026-06-27 (session 21) — more `query --windows` properties
+
+- Extended the pure `query --windows` serializer with properties the `AppState`
+  already owns: `space` (runtime sid), `display` (1-based arrangement index, via
+  the new `pub AppState::display_index`), `is-visible` (new `space_is_visible`,
+  mirroring the C `space_is_visible`), `split-type`/`split-child` (from the
+  window's BSP node — parent split orientation and left/right child, matching the
+  C `window.c` strings incl. the lone-root → `second_child` quirk), and
+  `has-fullscreen-zoom`/`has-parent-zoom` (from `Tree::zoomed`). Added
+  `NodeSplit::as_str` (`window_node_split_str`) in `yabai-core`.
+- Scope notes / deliberate divergences (consistent with the rest of the Rust query
+  layer): `space` emits the runtime sid, not the Mission Control index (same as
+  numeric `--space` selectors); `display` emits the arrangement index, matching C.
+  Not added: `is-floating`/`is-minimized`/`is-native-fullscreen` (floating,
+  minimized, and native-fullscreen windows leave the BSP trees in the Rust model,
+  so they never appear in `query --windows` — emitting an always-`false` value
+  would imply tracking that does not exist); `role`/`subrole`/`level`/`layer`/
+  `opacity`/`can-move`/etc. need live AX/SkyLight state.
+- Added a pure golden test (`query_windows_serializes_space_display_and_tree_properties`)
+  and live-verified against the WM daemon: a lone Finder window reported
+  `space:18, display:1, is-visible:true, split-type:"none", split-child:"second_child"`.
+- Verification: `cargo fmt --all`; `cargo test --workspace` (147 tests);
+  `cargo clippy --workspace --all-targets`; `cargo build --release -p yabai`.
 
 ### 2026-06-26 (session 20) — system/display/dock/menu-bar signals
 

@@ -1226,7 +1226,21 @@ impl AppState {
     fn query_windows(&self, cmd: &QueryCommand) -> Response {
         let properties = query_properties(
             &cmd.properties,
-            &["id", "pid", "app", "title", "frame", "has-focus"],
+            &[
+                "id",
+                "pid",
+                "app",
+                "title",
+                "frame",
+                "has-focus",
+                "space",
+                "display",
+                "is-visible",
+                "split-type",
+                "split-child",
+                "has-fullscreen-zoom",
+                "has-parent-zoom",
+            ],
             "window",
         )?;
 
@@ -1363,6 +1377,40 @@ impl AppState {
                     "\t\"has-focus\":{}",
                     json_bool(self.focused_window == Some(frame.window_id))
                 )),
+                "space" => fields.push(format!(
+                    "\t\"space\":{}",
+                    self.window_space(frame.window_id).unwrap_or(0)
+                )),
+                "display" => fields.push(format!(
+                    "\t\"display\":{}",
+                    self.window_space(frame.window_id)
+                        .and_then(|sid| self.space_displays.get(&sid).copied())
+                        .and_then(|did| self.display_index(did))
+                        .unwrap_or(0)
+                )),
+                "is-visible" => fields.push(format!(
+                    "\t\"is-visible\":{}",
+                    json_bool(
+                        self.window_space(frame.window_id)
+                            .is_some_and(|sid| self.space_is_visible(sid))
+                    )
+                )),
+                "split-type" => fields.push(format!(
+                    "\t\"split-type\":\"{}\"",
+                    self.window_split_info(frame.window_id).0
+                )),
+                "split-child" => fields.push(format!(
+                    "\t\"split-child\":\"{}\"",
+                    self.window_split_info(frame.window_id).1
+                )),
+                "has-fullscreen-zoom" => fields.push(format!(
+                    "\t\"has-fullscreen-zoom\":{}",
+                    json_bool(self.window_zoom(frame.window_id) == Some(ZoomKind::Fullscreen))
+                )),
+                "has-parent-zoom" => fields.push(format!(
+                    "\t\"has-parent-zoom\":{}",
+                    json_bool(self.window_zoom(frame.window_id) == Some(ZoomKind::Parent))
+                )),
                 _ => unreachable!("query_properties rejects unsupported properties"),
             }
         }
@@ -1380,6 +1428,54 @@ impl AppState {
         self.spaces
             .iter()
             .find_map(|(&sid, tree)| tree.window_list().contains(&window_id).then_some(sid))
+    }
+
+    /// Whether a space is currently visible (the active space on its display, or
+    /// the global active space when no per-display active space is recorded).
+    /// Mirrors the C `space_is_visible`.
+    fn space_is_visible(&self, sid: u64) -> bool {
+        if let Some(did) = self.space_displays.get(&sid) {
+            if let Some(&active) = self.display_active_space.get(did) {
+                return active == sid;
+            }
+        }
+        self.active_space == Some(sid)
+    }
+
+    /// The `split-type` / `split-child` strings for a window, mirroring the C
+    /// `window.c` logic: split-type is the parent node's split (`none` at the
+    /// root), and split-child is `first_child` iff the node is its parent's left
+    /// child, else `second_child` (so a lone root window is `second_child`).
+    fn window_split_info(&self, window_id: u32) -> (&'static str, &'static str) {
+        for tree in self.spaces.values() {
+            if let Some(node_id) = tree.find_window_node(window_id) {
+                let (split, is_left) = match tree.node(node_id).parent {
+                    Some(parent_id) => {
+                        let parent = tree.node(parent_id);
+                        (parent.split, parent.left == Some(node_id))
+                    }
+                    None => (NodeSplit::None, false),
+                };
+                return (
+                    split.as_str(),
+                    if is_left {
+                        "first_child"
+                    } else {
+                        "second_child"
+                    },
+                );
+            }
+        }
+        ("none", "none")
+    }
+
+    /// The zoom state of a window, if any (used for `has-fullscreen-zoom` /
+    /// `has-parent-zoom`).
+    fn window_zoom(&self, window_id: u32) -> Option<ZoomKind> {
+        self.spaces.values().find_map(|tree| match tree.zoomed() {
+            Some((zid, kind)) if zid == window_id => Some(kind),
+            _ => None,
+        })
     }
 
     fn display_spaces(&self, display_id: u32) -> Vec<u64> {
@@ -2263,6 +2359,29 @@ mod tests {
             Ok(Some(
                 "[{\n\t\"id\":1,\n\t\"frame\":{\n\t\t\"x\":0.0000,\n\t\t\"y\":0.0000,\n\t\t\"w\":500.0000,\n\t\t\"h\":1000.0000\n\t},\n\t\"has-focus\":false\n},{\n\t\"id\":2,\n\t\"frame\":{\n\t\t\"x\":500.0000,\n\t\t\"y\":0.0000,\n\t\t\"w\":500.0000,\n\t\t\"h\":1000.0000\n\t},\n\t\"has-focus\":true\n}]\n".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn query_windows_serializes_space_display_and_tree_properties() {
+        let mut state = state_with_displays();
+        state.set_active_space(1);
+        state.add_window(10).unwrap();
+        state.add_window(20).unwrap();
+
+        let out = state
+            .handle_tokens(&toks(&[
+                "query",
+                "--windows",
+                "id,space,display,is-visible,split-type,split-child,has-fullscreen-zoom",
+                "--space",
+                "1",
+            ]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            out,
+            "[{\n\t\"id\":10,\n\t\"space\":1,\n\t\"display\":1,\n\t\"is-visible\":true,\n\t\"split-type\":\"vertical\",\n\t\"split-child\":\"first_child\",\n\t\"has-fullscreen-zoom\":false\n},{\n\t\"id\":20,\n\t\"space\":1,\n\t\"display\":1,\n\t\"is-visible\":true,\n\t\"split-type\":\"vertical\",\n\t\"split-child\":\"second_child\",\n\t\"has-fullscreen-zoom\":false\n}]\n"
         );
     }
 

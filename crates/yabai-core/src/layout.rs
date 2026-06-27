@@ -38,6 +38,16 @@ pub enum NodeSplit {
 }
 
 impl NodeSplit {
+    /// The `query` JSON string for this split, matching `window_node_split_str`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NodeSplit::None => "none",
+            NodeSplit::Vertical => "vertical",
+            NodeSplit::Horizontal => "horizontal",
+            NodeSplit::Auto => "auto",
+        }
+    }
+
     fn to_geometry(self) -> Split {
         match self {
             NodeSplit::Horizontal => Split::Horizontal,
