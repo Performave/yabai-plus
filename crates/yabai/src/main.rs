@@ -16,11 +16,11 @@ use yabai_macos::{
     AxSink, ObservedEvent, WorkspaceEvent, accessibility_trusted_with_prompt, active_displays,
     application_pids_with_windows, current_space_for_display, cursor_display_id, cursor_location,
     display_for_space, focused_window, focused_window_diagnostics, main_visible_frame,
-    mission_control_spaces, move_focused_window, move_pid_window, observe_pid, observe_workspace,
-    pid_window_infos, regular_application_pids, set_active_display, spaces_for_display,
-    spaces_for_window, switch_space_by_gesture, tileable_pid_windows, visible_frame_for_display,
-    warp_cursor_to_display_center, warp_cursor_to_point, windows_for_pid,
-    windows_for_pid_diagnostics,
+    mission_control_spaces, move_focused_window, move_pid_window, ns_application_load, observe_pid,
+    observe_workspace, pid_window_infos, regular_application_pids, set_active_display,
+    spaces_for_display, spaces_for_window, switch_space_by_gesture, tileable_pid_windows,
+    visible_frame_for_display, warp_cursor_to_display_center, warp_cursor_to_point,
+    windows_for_pid, windows_for_pid_diagnostics,
 };
 use yabai_runtime::{
     Actor, AppState, LayoutSink, RecordingSink, Response, Runtime, StateEvent, WindowMeta,
@@ -584,11 +584,14 @@ fn spawn_observer(pid: i32, tx: &Sender<WmWork>) {
     });
 }
 
-fn spawn_workspace_observer(tx: &Sender<WmWork>) {
+/// Bridge NSWorkspace events into the daemon channel. Returns the sender to hand
+/// to `observe_workspace`, which must run on the **main thread**: it blocks in
+/// `CFRunLoopRun`, and that main-thread run loop (set up by `NSApplicationLoad`)
+/// is the only one that services NSWorkspace notifications — mirroring the C
+/// daemon's `[NSApp run]` on its main thread while the event loop runs on a
+/// worker pthread.
+fn start_workspace_bridge(tx: &Sender<WmWork>) -> Sender<WorkspaceEvent> {
     let (otx, orx) = channel::<WorkspaceEvent>();
-    thread::spawn(move || {
-        let _ = observe_workspace(otx);
-    });
     let tx = tx.clone();
     thread::spawn(move || {
         for event in orx {
@@ -597,6 +600,7 @@ fn spawn_workspace_observer(tx: &Sender<WmWork>) {
             }
         }
     });
+    otx
 }
 
 fn managed_space_for_window(state: &AppState, window_id: u32) -> Option<u64> {
@@ -1461,6 +1465,12 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Initialize AppKit so this non-bundled tool actually receives NSWorkspace
+    // notifications (application launch/terminate/activate/hide, active space).
+    // Mirrors `NSApplicationLoad()` in the C daemon's `main`. Must run on the main
+    // thread before the workspace observer spawns.
+    ns_application_load();
+
     let is_all = target == "all";
     let pids: Vec<i32> = if is_all {
         // CGWindowList reflects current on-screen windows and refreshes live.
@@ -1579,7 +1589,7 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
         observed.insert(*pid);
         spawn_observer(*pid, &tx);
     }
-    spawn_workspace_observer(&tx);
+    let workspace_tx = start_workspace_bridge(&tx);
 
     // Periodic self-heal tick (also picks up newly launched apps in `all` mode).
     {
@@ -1617,223 +1627,44 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
         "yabai-rust: tracking live window changes; send commands with a matching USER (e.g. USER=<name> yabai -m space --rotate 90)"
     );
 
-    for work in rx {
-        match work {
-            WmWork::Observed(event) => {
-                let pid = event.pid();
-                let focused = match &event {
-                    ObservedEvent::FocusedWindowChanged {
-                        window_id: Some(id),
-                        ..
-                    } => Some(*id),
-                    _ => None,
-                };
-                refresh_live_display_state(&mut runtime, &mut display_frames);
-                if let Some((signal, window_id)) = observed_geometry_signal(&runtime, &event) {
-                    let active = runtime.state.focused_window_id() == Some(window_id);
-                    let meta = runtime.state.window_meta(window_id);
-                    fire_signals(
-                        &runtime,
-                        signal,
-                        &[("YABAI_WINDOW_ID", window_id.to_string())],
-                        meta.map(|m| m.app.as_str()),
-                        meta.map(|m| m.title.as_str()),
-                        Some(active),
-                    );
-                }
-                reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
-                // Focus may have moved to a window on another display; point the
-                // command-active space at the focused window's space.
-                if let Some(window_id) = focused {
-                    if let Some(sid) = runtime.state.window_space_id(window_id) {
-                        runtime.state.set_active_space(sid);
-                        let _ = runtime
-                            .state
-                            .handle_event(StateEvent::WindowFocused { window_id });
-                    }
-                    center_mouse_on_focus(&runtime, window_id);
-                    // `window_focused` signal (observer-driven focus, e.g. a
-                    // click). De-duplicated against the command path below.
-                    if last_focus_signal != Some(window_id) {
-                        last_focus_signal = Some(window_id);
+    let worker = thread::spawn(move || {
+        for work in rx {
+            match work {
+                WmWork::Observed(event) => {
+                    let pid = event.pid();
+                    let focused = match &event {
+                        ObservedEvent::FocusedWindowChanged {
+                            window_id: Some(id),
+                            ..
+                        } => Some(*id),
+                        _ => None,
+                    };
+                    refresh_live_display_state(&mut runtime, &mut display_frames);
+                    if let Some((signal, window_id)) = observed_geometry_signal(&runtime, &event) {
+                        let active = runtime.state.focused_window_id() == Some(window_id);
                         let meta = runtime.state.window_meta(window_id);
                         fire_signals(
                             &runtime,
-                            SignalEvent::WindowFocused,
+                            signal,
                             &[("YABAI_WINDOW_ID", window_id.to_string())],
                             meta.map(|m| m.app.as_str()),
                             meta.map(|m| m.title.as_str()),
-                            None,
+                            Some(active),
                         );
                     }
-                }
-            }
-            WmWork::Workspace(event) => match event {
-                WorkspaceEvent::ActiveSpaceChanged => {
-                    refresh_live_display_state(&mut runtime, &mut display_frames);
-                    for pid in observed.iter().copied().collect::<Vec<_>>() {
-                        reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
-                    }
-                    if let Some(sid) = runtime.state.active_space_id() {
-                        fire_signals(
-                            &runtime,
-                            SignalEvent::SpaceChanged,
-                            &[("YABAI_SPACE_ID", sid.to_string())],
-                            None,
-                            None,
-                            None,
-                        );
-                    }
-                }
-                WorkspaceEvent::ApplicationLaunched { pid, app } => {
-                    // Fire the signal regardless of tiling mode; it is about the
-                    // event, not whether this daemon manages the app.
-                    fire_signals(
-                        &runtime,
-                        SignalEvent::ApplicationLaunched,
-                        &[("YABAI_PROCESS_ID", pid.to_string())],
-                        Some(&app),
-                        None,
-                        None,
-                    );
-                    if is_all && observed.insert(pid) {
-                        spawn_observer(pid, &tx);
-                        refresh_live_display_state(&mut runtime, &mut display_frames);
-                        reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
-                    }
-                }
-                WorkspaceEvent::ApplicationActivated { pid, app } => {
-                    front_pid = Some(pid);
-                    fire_signals(
-                        &runtime,
-                        SignalEvent::ApplicationActivated,
-                        &[("YABAI_PROCESS_ID", pid.to_string())],
-                        Some(&app),
-                        None,
-                        None,
-                    );
-                }
-                WorkspaceEvent::ApplicationDeactivated { pid, app } => {
-                    fire_signals(
-                        &runtime,
-                        SignalEvent::ApplicationDeactivated,
-                        &[("YABAI_PROCESS_ID", pid.to_string())],
-                        Some(&app),
-                        None,
-                        None,
-                    );
-                }
-                WorkspaceEvent::ApplicationVisible { pid, app } => {
-                    fire_signals(
-                        &runtime,
-                        SignalEvent::ApplicationVisible,
-                        &[("YABAI_PROCESS_ID", pid.to_string())],
-                        Some(&app),
-                        None,
-                        None,
-                    );
-                }
-                WorkspaceEvent::ApplicationHidden { pid, app } => {
-                    // The hidden category filters on app + active (front app), per
-                    // `event_signal.c`.
-                    let active = front_pid == Some(pid);
-                    fire_signals(
-                        &runtime,
-                        SignalEvent::ApplicationHidden,
-                        &[("YABAI_PROCESS_ID", pid.to_string())],
-                        Some(&app),
-                        None,
-                        Some(active),
-                    );
-                }
-                WorkspaceEvent::ApplicationTerminated { pid, app } => {
-                    fire_signals(
-                        &runtime,
-                        SignalEvent::ApplicationTerminated,
-                        &[("YABAI_PROCESS_ID", pid.to_string())],
-                        Some(&app),
-                        None,
-                        Some(front_pid == Some(pid)),
-                    );
-                    if observed.remove(&pid) {
-                        for window_id in minimized_pids
-                            .iter()
-                            .filter_map(|(&window_id, &window_pid)| {
-                                (window_pid == pid).then_some(window_id)
-                            })
-                            .collect::<Vec<_>>()
-                        {
-                            minimized_pids.remove(&window_id);
-                            runtime.sink.unregister_minimized(window_id);
-                        }
-                        for window_id in fullscreen_pids
-                            .iter()
-                            .filter_map(|(&window_id, &window_pid)| {
-                                (window_pid == pid).then_some(window_id)
-                            })
-                            .collect::<Vec<_>>()
-                        {
-                            fullscreen_pids.remove(&window_id);
-                            runtime.sink.unregister_fullscreen(window_id);
-                        }
-                        drop_pid(&mut runtime, &mut managed, &mut signaled, pid);
-                    }
-                }
-            },
-            WmWork::Tick => {
-                refresh_live_display_state(&mut runtime, &mut display_frames);
-                // In `all` mode, pick up apps launched after startup via the live
-                // CGWindowList scan, and start observing each.
-                if is_all {
-                    for pid in application_pids_with_windows() {
-                        if observed.insert(pid) {
-                            spawn_observer(pid, &tx);
-                        }
-                    }
-                }
-                // Self-heal: re-reconcile every known app, catching any window
-                // change an observer missed (e.g. the unreliable AX destroy).
-                for pid in observed.iter().copied().collect::<Vec<_>>() {
                     reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
-                }
-            }
-            WmWork::Message { tokens, reply } => {
-                refresh_live_display_state(&mut runtime, &mut display_frames);
-                // Some commands need macOS-layer state/effects the pure core can't
-                // perform; handle those here, otherwise fall through.
-                let fullscreen_exit = try_window_native_fullscreen_exit(
-                    &mut runtime,
-                    &mut managed,
-                    &mut signaled,
-                    &mut fullscreen_pids,
-                    &tokens,
-                );
-                let was_fullscreen_exit = fullscreen_exit.is_some();
-                let response = match fullscreen_exit {
-                    Some(response) => response,
-                    None => match try_window_deminimize(
-                        &mut runtime,
-                        &mut managed,
-                        &mut signaled,
-                        &mut minimized_pids,
-                        &tokens,
-                    ) {
-                        Some(response) => response,
-                        None => match try_space_focus(&mut runtime, &display_frames, &tokens) {
-                            Some(response) => response,
-                            None => runtime.message(&tokens),
-                        },
-                    },
-                };
-                // A successful `window --focus` updated the pure focus target;
-                // now enact it on the real window (raise + make key).
-                if response.is_ok() && is_window_focus(&tokens) {
-                    if let Some(window_id) = runtime.state.focused_window_id() {
-                        runtime.sink.focus_window(window_id);
+                    // Focus may have moved to a window on another display; point the
+                    // command-active space at the focused window's space.
+                    if let Some(window_id) = focused {
+                        if let Some(sid) = runtime.state.window_space_id(window_id) {
+                            runtime.state.set_active_space(sid);
+                            let _ = runtime
+                                .state
+                                .handle_event(StateEvent::WindowFocused { window_id });
+                        }
                         center_mouse_on_focus(&runtime, window_id);
-                        // Fire `window_focused` here too: command-driven focus does
-                        // not always produce an AX observer notification. De-dup
-                        // with the observer path via `last_focus_signal`.
+                        // `window_focused` signal (observer-driven focus, e.g. a
+                        // click). De-duplicated against the command path below.
                         if last_focus_signal != Some(window_id) {
                             last_focus_signal = Some(window_id);
                             let meta = runtime.state.window_meta(window_id);
@@ -1848,65 +1679,256 @@ fn run_rust_wm_daemon(args: &[String]) -> ExitCode {
                         }
                     }
                 }
-                // `window --minimize`: AX-minimize the focused window, then
-                // reconcile its app so the now-untileable window leaves the tree
-                // and the rest re-tile.
-                if response.is_ok() && is_window_minimize(&tokens) {
-                    if let Some(window_id) = runtime.state.focused_window_id() {
-                        let pid = runtime.state.window_pid(window_id);
-                        let active = runtime.state.focused_window_id() == Some(window_id);
-                        let meta = runtime.state.window_meta(window_id).cloned();
-                        if runtime.sink.set_minimized(window_id, true) {
-                            if let Some(pid) = pid {
-                                minimized_pids.insert(window_id, pid);
-                                reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
-                            }
+                WmWork::Workspace(event) => match event {
+                    WorkspaceEvent::ActiveSpaceChanged => {
+                        refresh_live_display_state(&mut runtime, &mut display_frames);
+                        for pid in observed.iter().copied().collect::<Vec<_>>() {
+                            reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
+                        }
+                        if let Some(sid) = runtime.state.active_space_id() {
                             fire_signals(
                                 &runtime,
-                                SignalEvent::WindowMinimized,
-                                &[("YABAI_WINDOW_ID", window_id.to_string())],
-                                meta.as_ref().map(|m| m.app.as_str()),
-                                meta.as_ref().map(|m| m.title.as_str()),
-                                Some(active),
+                                SignalEvent::SpaceChanged,
+                                &[("YABAI_SPACE_ID", sid.to_string())],
+                                None,
+                                None,
+                                None,
                             );
                         }
                     }
-                }
-                // `window --close`: press the AX close button for the acting
-                // window. AX destroy is unreliable, so reconcile immediately and
-                // let the 3s tick catch any delayed close.
-                if response.is_ok() && is_window_close(&tokens) {
-                    if let Some(window_id) = runtime.state.focused_window_id() {
-                        let pid = runtime.state.window_pid(window_id);
-                        if runtime.sink.close_window(window_id) {
-                            if let Some(pid) = pid {
-                                reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
+                    WorkspaceEvent::ApplicationLaunched { pid, app } => {
+                        // Fire the signal regardless of tiling mode; it is about the
+                        // event, not whether this daemon manages the app.
+                        fire_signals(
+                            &runtime,
+                            SignalEvent::ApplicationLaunched,
+                            &[("YABAI_PROCESS_ID", pid.to_string())],
+                            Some(&app),
+                            None,
+                            None,
+                        );
+                        if is_all && observed.insert(pid) {
+                            spawn_observer(pid, &tx);
+                            refresh_live_display_state(&mut runtime, &mut display_frames);
+                            reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
+                        }
+                    }
+                    WorkspaceEvent::ApplicationActivated { pid, app } => {
+                        front_pid = Some(pid);
+                        fire_signals(
+                            &runtime,
+                            SignalEvent::ApplicationActivated,
+                            &[("YABAI_PROCESS_ID", pid.to_string())],
+                            Some(&app),
+                            None,
+                            None,
+                        );
+                    }
+                    WorkspaceEvent::ApplicationDeactivated { pid, app } => {
+                        fire_signals(
+                            &runtime,
+                            SignalEvent::ApplicationDeactivated,
+                            &[("YABAI_PROCESS_ID", pid.to_string())],
+                            Some(&app),
+                            None,
+                            None,
+                        );
+                    }
+                    WorkspaceEvent::ApplicationVisible { pid, app } => {
+                        fire_signals(
+                            &runtime,
+                            SignalEvent::ApplicationVisible,
+                            &[("YABAI_PROCESS_ID", pid.to_string())],
+                            Some(&app),
+                            None,
+                            None,
+                        );
+                    }
+                    WorkspaceEvent::ApplicationHidden { pid, app } => {
+                        // The hidden category filters on app + active (front app), per
+                        // `event_signal.c`.
+                        let active = front_pid == Some(pid);
+                        fire_signals(
+                            &runtime,
+                            SignalEvent::ApplicationHidden,
+                            &[("YABAI_PROCESS_ID", pid.to_string())],
+                            Some(&app),
+                            None,
+                            Some(active),
+                        );
+                    }
+                    WorkspaceEvent::ApplicationTerminated { pid, app } => {
+                        fire_signals(
+                            &runtime,
+                            SignalEvent::ApplicationTerminated,
+                            &[("YABAI_PROCESS_ID", pid.to_string())],
+                            Some(&app),
+                            None,
+                            Some(front_pid == Some(pid)),
+                        );
+                        if observed.remove(&pid) {
+                            for window_id in minimized_pids
+                                .iter()
+                                .filter_map(|(&window_id, &window_pid)| {
+                                    (window_pid == pid).then_some(window_id)
+                                })
+                                .collect::<Vec<_>>()
+                            {
+                                minimized_pids.remove(&window_id);
+                                runtime.sink.unregister_minimized(window_id);
+                            }
+                            for window_id in fullscreen_pids
+                                .iter()
+                                .filter_map(|(&window_id, &window_pid)| {
+                                    (window_pid == pid).then_some(window_id)
+                                })
+                                .collect::<Vec<_>>()
+                            {
+                                fullscreen_pids.remove(&window_id);
+                                runtime.sink.unregister_fullscreen(window_id);
+                            }
+                            drop_pid(&mut runtime, &mut managed, &mut signaled, pid);
+                        }
+                    }
+                },
+                WmWork::Tick => {
+                    refresh_live_display_state(&mut runtime, &mut display_frames);
+                    // In `all` mode, pick up apps launched after startup via the live
+                    // CGWindowList scan, and start observing each.
+                    if is_all {
+                        for pid in application_pids_with_windows() {
+                            if observed.insert(pid) {
+                                spawn_observer(pid, &tx);
                             }
                         }
                     }
+                    // Self-heal: re-reconcile every known app, catching any window
+                    // change an observer missed (e.g. the unreliable AX destroy).
+                    for pid in observed.iter().copied().collect::<Vec<_>>() {
+                        reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
+                    }
                 }
-                // `window --toggle native-fullscreen` (enter half): focus the
-                // window (the AX attribute is only honored on the key window, per
-                // the C daemon), set AXFullscreen, then reconcile so the window —
-                // now on its own fullscreen space — leaves the tiled layout. The
-                // exit half is handled by the intercept above.
-                if !was_fullscreen_exit && response.is_ok() && is_window_native_fullscreen(&tokens)
-                {
-                    if let Some(window_id) = runtime.state.focused_window_id() {
-                        let pid = runtime.state.window_pid(window_id);
-                        runtime.sink.focus_window(window_id);
-                        if runtime.sink.enter_native_fullscreen(window_id) {
-                            if let Some(pid) = pid {
-                                fullscreen_pids.insert(window_id, pid);
-                                reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
+                WmWork::Message { tokens, reply } => {
+                    refresh_live_display_state(&mut runtime, &mut display_frames);
+                    // Some commands need macOS-layer state/effects the pure core can't
+                    // perform; handle those here, otherwise fall through.
+                    let fullscreen_exit = try_window_native_fullscreen_exit(
+                        &mut runtime,
+                        &mut managed,
+                        &mut signaled,
+                        &mut fullscreen_pids,
+                        &tokens,
+                    );
+                    let was_fullscreen_exit = fullscreen_exit.is_some();
+                    let response = match fullscreen_exit {
+                        Some(response) => response,
+                        None => match try_window_deminimize(
+                            &mut runtime,
+                            &mut managed,
+                            &mut signaled,
+                            &mut minimized_pids,
+                            &tokens,
+                        ) {
+                            Some(response) => response,
+                            None => match try_space_focus(&mut runtime, &display_frames, &tokens) {
+                                Some(response) => response,
+                                None => runtime.message(&tokens),
+                            },
+                        },
+                    };
+                    // A successful `window --focus` updated the pure focus target;
+                    // now enact it on the real window (raise + make key).
+                    if response.is_ok() && is_window_focus(&tokens) {
+                        if let Some(window_id) = runtime.state.focused_window_id() {
+                            runtime.sink.focus_window(window_id);
+                            center_mouse_on_focus(&runtime, window_id);
+                            // Fire `window_focused` here too: command-driven focus does
+                            // not always produce an AX observer notification. De-dup
+                            // with the observer path via `last_focus_signal`.
+                            if last_focus_signal != Some(window_id) {
+                                last_focus_signal = Some(window_id);
+                                let meta = runtime.state.window_meta(window_id);
+                                fire_signals(
+                                    &runtime,
+                                    SignalEvent::WindowFocused,
+                                    &[("YABAI_WINDOW_ID", window_id.to_string())],
+                                    meta.map(|m| m.app.as_str()),
+                                    meta.map(|m| m.title.as_str()),
+                                    None,
+                                );
                             }
                         }
                     }
+                    // `window --minimize`: AX-minimize the focused window, then
+                    // reconcile its app so the now-untileable window leaves the tree
+                    // and the rest re-tile.
+                    if response.is_ok() && is_window_minimize(&tokens) {
+                        if let Some(window_id) = runtime.state.focused_window_id() {
+                            let pid = runtime.state.window_pid(window_id);
+                            let active = runtime.state.focused_window_id() == Some(window_id);
+                            let meta = runtime.state.window_meta(window_id).cloned();
+                            if runtime.sink.set_minimized(window_id, true) {
+                                if let Some(pid) = pid {
+                                    minimized_pids.insert(window_id, pid);
+                                    reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
+                                }
+                                fire_signals(
+                                    &runtime,
+                                    SignalEvent::WindowMinimized,
+                                    &[("YABAI_WINDOW_ID", window_id.to_string())],
+                                    meta.as_ref().map(|m| m.app.as_str()),
+                                    meta.as_ref().map(|m| m.title.as_str()),
+                                    Some(active),
+                                );
+                            }
+                        }
+                    }
+                    // `window --close`: press the AX close button for the acting
+                    // window. AX destroy is unreliable, so reconcile immediately and
+                    // let the 3s tick catch any delayed close.
+                    if response.is_ok() && is_window_close(&tokens) {
+                        if let Some(window_id) = runtime.state.focused_window_id() {
+                            let pid = runtime.state.window_pid(window_id);
+                            if runtime.sink.close_window(window_id) {
+                                if let Some(pid) = pid {
+                                    reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
+                                }
+                            }
+                        }
+                    }
+                    // `window --toggle native-fullscreen` (enter half): focus the
+                    // window (the AX attribute is only honored on the key window, per
+                    // the C daemon), set AXFullscreen, then reconcile so the window —
+                    // now on its own fullscreen space — leaves the tiled layout. The
+                    // exit half is handled by the intercept above.
+                    if !was_fullscreen_exit
+                        && response.is_ok()
+                        && is_window_native_fullscreen(&tokens)
+                    {
+                        if let Some(window_id) = runtime.state.focused_window_id() {
+                            let pid = runtime.state.window_pid(window_id);
+                            runtime.sink.focus_window(window_id);
+                            if runtime.sink.enter_native_fullscreen(window_id) {
+                                if let Some(pid) = pid {
+                                    fullscreen_pids.insert(window_id, pid);
+                                    reconcile_pid(&mut runtime, &mut managed, &mut signaled, pid);
+                                }
+                            }
+                        }
+                    }
+                    let _ = reply.send(response);
                 }
-                let _ = reply.send(response);
             }
         }
-    }
+    });
+
+    // Run the NSWorkspace observer on the main thread. It blocks in CFRunLoopRun,
+    // the only run loop that services NSWorkspace notifications (application
+    // launch/terminate/activate/deactivate/hide/unhide and active-space changes).
+    // This mirrors `[NSApp run]` on the C daemon's main thread while its event
+    // loop runs on a worker pthread.
+    let _ = observe_workspace(workspace_tx);
+    let _ = worker.join();
     ExitCode::SUCCESS
 }
 

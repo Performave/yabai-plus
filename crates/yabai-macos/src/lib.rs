@@ -41,7 +41,9 @@ pub use space::{
     spaces_for_window, switch_space_by_gesture,
 };
 #[cfg(target_os = "macos")]
-pub use workspace::{WorkspaceEvent, observe_workspace, regular_application_pids};
+pub use workspace::{
+    WorkspaceEvent, ns_application_load, observe_workspace, regular_application_pids,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DisplayId(pub u32);

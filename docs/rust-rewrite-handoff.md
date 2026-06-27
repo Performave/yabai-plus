@@ -63,19 +63,44 @@ reconstructing context.
   The pure runtime already categorized all of these (activated/deactivated/visible
   = app filter only; hidden/terminated = app + active), so no runtime changes were
   needed — only the live firing.
-- Live verification BLOCKED by the environment, same wall as session 12: the
-  NSWorkspace-driven application notifications are not delivered to an SSH-launched
-  daemon, and a GUI-session launch (LaunchAgent bootstrapped into `gui/501`) failed
-  the Accessibility check because the path-bound TCC grant for `/tmp/yabai-rust`
-  was created for a previous binary's cdhash and the redeploy invalidated it for
-  the GUI context. Re-granting requires writing the user TCC.db, which the harness
-  safety classifier blocks. Confirmed over SSH that the daemon is healthy with the
-  change (starts, `signal --add event=application_activated` succeeds, queries
-  work). The firing path is wired exactly like the verified `application_launched`/
-  `application_terminated` signals, which use the same NSWorkspace observer.
+- **Root-caused and fixed why NSWorkspace notifications never fired live** (this
+  had been an open caveat since session 12 — application launch/terminate and
+  active-space signals had *never* been verified live). Two missing pieces, both
+  from the C daemon's `main`:
+  1. `NSApplicationLoad()` — a non-bundled command-line tool must call this to
+     establish the AppKit/Cocoa machinery; without it the NSWorkspace notification
+     connection is never set up and notifications are silently dropped. Added
+     `yabai-macos::workspace::ns_application_load()` (links AppKit) and call it once
+     at WM-daemon startup on the main thread.
+  2. The AppKit/CF run loop must run on the **main thread**. The C daemon runs
+     `[NSApp run]` on main while its event loop runs on a worker pthread; the Rust
+     daemon had it inverted (event loop on main, no run loop). Restructured
+     `run_rust_wm_daemon`: the unified event-processing loop (owning
+     `Runtime<AxSink>`) now runs on a dedicated worker thread, and the main thread
+     runs `observe_workspace` (which blocks in `CFRunLoopRun`). `AxSink` ops stay
+     single-threaded on that one worker thread — and AX-from-worker matches the C
+     daemon, which also touches AX on its worker pthread, not main. Replaced
+     `spawn_workspace_observer` with `start_workspace_bridge` (returns the sender;
+     the caller runs `observe_workspace` on main).
+- Live verification on `ssh student@student` (macOS 26.5.1), WM daemon launched as
+  a `gui/501` LaunchAgent (required: NSWorkspace notifications are aqua-session
+  scoped and never reach an SSH-launched daemon; aqua-session Accessibility is read
+  from the root-owned **system** TCC.db). Registered all four new signals plus
+  `application_launched`/`application_terminated` and an `app='^Chess$'`-filtered
+  activation. Focus-switching Calculator/TextEdit wrote `deactivated`/`activated`
+  pairs with correct pids; hiding/unhiding Calculator wrote `hidden`/`visible`;
+  launching+quitting Chess wrote `launched`/`terminated`; the app filter wrote
+  `chess-activated` only for Chess (not the Calculator/TextEdit activations). This
+  is the first live confirmation of the entire NSWorkspace observer subsystem.
+- TCC note for the remote runbook: aqua-session (GUI LaunchAgent) Accessibility
+  needs a grant in `/Library/.../TCC.db` (root, sudo) whose `csreq` matches the
+  binary. To avoid re-granting on every rebuild, ad-hoc sign with a fixed
+  identifier (`codesign -fs - --identifier com.test.yabai`) and grant a
+  `csreq` keyed to `identifier "com.test.yabai"`; then rebuilds only need
+  re-signing, no sudo.
 - Verification: `cargo fmt --all`; `cargo test --workspace` (146 tests, no new
-  unit test — the change is in the macOS/daemon FFI+event-wiring layer, which is
-  not unit-tested; the runtime filter categories were already covered);
+  unit test — the change is in the macOS/daemon FFI + thread-structure layer, which
+  is not unit-tested; the runtime filter categories were already covered);
   `cargo clippy --workspace --all-targets`; `cargo build --release -p yabai`.
 
 ### 2026-06-25 (session 16) — moved/resized signals
@@ -1486,9 +1511,12 @@ deminimize/title-change events and app/title filters for metadata-carrying event
    `application_deactivated`, `application_hidden`, and `application_visible`
    (with `YABAI_*` env vars). Still to do: `application_front_switched` (needs
    front/last-front pid tracking with `YABAI_RECENT_PROCESS_ID`), the
-   space/display/Mission Control/system event categories, and live verification
-   of the NSWorkspace-driven application signals from a GUI-launched daemon
-   session (blocked in the current test harness — see session 17).
+   space/display/Mission Control/system event categories.
+   The NSWorkspace-driven application signals (launch/terminate/activate/
+   deactivate/hide/visible) and app filters are now verified live from a
+   `gui/501` LaunchAgent daemon — see session 17, which also fixed the long-
+   standing reason NSWorkspace notifications never fired (`NSApplicationLoad` +
+   running the AppKit run loop on the main thread).
 5. Then Phases 7-9: scripting addition (`yabai-sa`, currently empty — required
    for space management / cross-space moves on modern macOS), OSAX spike, and
    production packaging (wire the Rust binary into `make`, signing, notarization,

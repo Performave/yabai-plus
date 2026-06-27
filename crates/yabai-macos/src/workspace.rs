@@ -43,6 +43,23 @@ unsafe extern "C" {
     fn class_addMethod(cls: Class, name: Sel, imp: *const c_void, types: *const c_char) -> bool;
 }
 
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {
+    fn NSApplicationLoad() -> bool;
+}
+
+/// Initialize the AppKit/Cocoa machinery for a non-bundled command-line tool, so
+/// the process actually receives `NSWorkspace` notifications. Mirrors the
+/// `NSApplicationLoad()` call in the C daemon's `main` (`src/yabai.c`). Without
+/// this, the NSWorkspace notification connection is never established and
+/// application/active-space notifications are silently never delivered. Call once
+/// on the main thread at startup, before spawning the workspace observer.
+pub fn ns_application_load() -> bool {
+    // SAFETY: `NSApplicationLoad` is a documented AppKit C function taking no
+    // arguments and returning a BOOL; it is safe to call once at startup.
+    unsafe { NSApplicationLoad() }
+}
+
 /// A typed `NSWorkspace` notification for the daemon event loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceEvent {
